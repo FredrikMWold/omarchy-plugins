@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "fredrik.github-prs",
+  "name": "GitHub pull requests",
+  "version": "1.0.0",
+  "author": "Fredrik",
+  "description": "Shows configured GitHub pull requests and opens a native picker",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "GitHub pull requests",
+    "description": "Pull requests authored by you and ready for review",
+    "category": "Network",
+    "allowMultiple": false
+  }
+}

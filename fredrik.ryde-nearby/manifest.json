@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "fredrik.ryde-nearby",
+  "name": "Ryde nearby",
+  "version": "2.3.0",
+  "author": "Fredrik",
+  "description": "Shows available Ryde scooters in a native map panel",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Ryde nearby",
+    "description": "Open a themed map of scooters near your current location",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
