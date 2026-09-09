@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "fredrik.lunch",
+  "name": "Kanalpiren lunch",
+  "version": "1.0.0",
+  "author": "Fredrik",
+  "description": "Shows today's lunch menu at Hinna Park Kanalpiren",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Kanalpiren lunch",
+    "description": "Today's hot dish and soup",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
