@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "id": "bylund.presenter-overlay",
+  "name": "Presenter Overlay",
+  "version": "0.1.0",
+  "author": "Andreas Bylund",
+  "description": "Presenter overlay: draw on screen, spotlight the cursor, and highlight clicks",
+  "homepage": "https://github.com/andreas-bylund/presenter-overlay",
+  "license": "MIT",
+  "kinds": [
+    "overlay",
+    "bar-widget"
+  ],
+  "keepLoaded": true,
+  "entryPoints": {
+    "overlay": "PresenterOverlay.qml",
+    "barWidget": "PresenterOverlayWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Presenter Overlay",
+    "description": "Opens the presenter overlay. Left click draws, right click spotlights the cursor, middle click clears the current annotations.",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
