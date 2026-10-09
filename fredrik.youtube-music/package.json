@@ -1,0 +1,9 @@
+{
+  "name": "fredrik-youtube-music-playback",
+  "version": "1.1.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "25.12.0"
+  }
+}

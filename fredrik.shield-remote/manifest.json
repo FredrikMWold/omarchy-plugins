@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "id": "fredrik.shield-remote",
+  "name": "Shield Remote",
+  "version": "0.1.0",
+  "author": "Fredrik",
+  "description": "Route a Shield remote between this computer and native Shield TV controls",
+  "kinds": ["bar-widget"],
+  "entryPoints": {"barWidget": "BarWidget.qml"},
+  "barWidget": {
+    "displayName": "Shield Remote",
+    "description": "Pair a Shield TV, inspect remote input, and select the control target",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

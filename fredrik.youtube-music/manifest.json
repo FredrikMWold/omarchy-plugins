@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "fredrik.youtube-music",
+  "name": "YouTube Music",
+  "version": "1.1.0",
+  "author": "Fredrik",
+  "description": "YouTube Music playback controls, playlists, library, and search",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "YouTube Music",
+    "description": "Control local playback and browse your YouTube Music account",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
