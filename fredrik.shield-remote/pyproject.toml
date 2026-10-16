@@ -3,7 +3,7 @@ name = "omarchy-shield-remote"
 version = "0.1.0"
 requires-python = ">=3.12,<3.13"
 dependencies = [
-    "androidtvremote2>=0.3.1,<0.4",
+    "androidtvremote2==0.3.2",
     "evdev>=1.9,<2",
 ]
 

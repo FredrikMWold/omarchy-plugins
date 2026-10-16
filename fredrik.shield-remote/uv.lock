@@ -115,7 +115,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
-    { name = "androidtvremote2", specifier = ">=0.3.1,<0.4" },
+    { name = "androidtvremote2", specifier = "==0.3.2" },
     { name = "evdev", specifier = ">=1.9,<2" },
 ]
 

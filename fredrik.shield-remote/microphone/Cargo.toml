@@ -1,0 +1,27 @@
+[package]
+name = "atvvoice"
+version = "0.2.0"
+edition = "2021"
+description = "Android TV Voice over BLE (ATVV) daemon for Linux/PipeWire"
+license = "MIT"
+
+[features]
+default = ["dbus"]
+dbus = ["dep:zbus"]
+
+[dependencies]
+bluer = { version = "0.17", features = ["bluetoothd"] }
+pipewire = { version = "0.9", features = ["v0_3_49"] }
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread", "signal", "time"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures = "0.3"
+anyhow = "1"
+num_enum = "0.7"
+bitflags = "2"
+zbus = { version = "5", features = ["tokio"], optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tokio-stream = "0.1"

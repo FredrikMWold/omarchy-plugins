@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 plugin_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-for tool in omarchy omarchy-shell hyprctl bluetoothctl systemctl udevadm busctl wpctl notify-send; do
+for tool in omarchy omarchy-shell hyprctl bluetoothctl systemctl udevadm busctl wpctl pactl pw-record notify-send curl; do
   if ! command -v "$tool" >/dev/null; then
     echo "Missing Omarchy prerequisite: $tool" >&2
     exit 1
@@ -11,10 +11,15 @@ if [[ -z "${HYPRLAND_INSTANCE_SIGNATURE:-}" || -z "${WAYLAND_DISPLAY:-}" ]]; the
   echo "Run setup from a terminal in your Omarchy desktop session." >&2
   exit 1
 fi
-response=$(hyprctl eval 'assert(type(hl.dsp.send_shortcut) == "function" and type(hl.dsp.focus) == "function" and type(hl.dsp.exec_cmd) == "function", "Current Hyprland Lua dispatchers are required")')
+response=$(hyprctl eval 'assert(type(hl.dsp.send_shortcut) == "function" and type(hl.dsp.focus) == "function" and type(hl.dsp.exec_cmd) == "function" and type(hl.dsp.window.move) == "function" and type(hl.dsp.window.fullscreen) == "function", "Current Hyprland Lua dispatchers are required")')
 if [[ "$response" != "ok" ]]; then
   printf 'Unsupported Hyprland session: %s\n' "$response" >&2
   exit 1
+fi
+if ! /usr/bin/python -c 'import gi; gi.require_version("Atspi", "2.0"); from gi.repository import Atspi' >/dev/null 2>&1; then
+  read -r -p "Stremio focus controls need python-gobject and at-spi2-core. Install using Omarchy? [y/N] " answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 1
+  omarchy pkg add python-gobject at-spi2-core
 fi
 
 data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/fredrik.shield-remote"
@@ -43,6 +48,13 @@ if ! command -v cc >/dev/null || [[ ! -r /usr/include/linux/input.h ]]; then
   [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 1
   omarchy pkg add gcc linux-api-headers
 fi
+if ! command -v cargo >/dev/null || ! command -v clang >/dev/null \
+    || ! command -v pkg-config >/dev/null \
+    || ! pkg-config --exists libpipewire-0.3 dbus-1; then
+  read -r -p "The bundled microphone needs Rust, Clang and PipeWire/D-Bus build libraries. Install using Omarchy? [y/N] " answer
+  [[ "$answer" == "y" || "$answer" == "Y" ]] || exit 1
+  omarchy pkg add rust clang pkgconf pipewire dbus
+fi
 "${uv_command[@]}" sync --project "$plugin_dir" --locked --no-dev --python 3.12
 
 known_remotes=$(bluetoothctl devices)
@@ -54,7 +66,8 @@ if ! grep -q ' NVIDIA SHIELD Remote$' <<<"$known_remotes"; then
   read -r -p "Press Enter after the remote appears in the Bluetooth panel." _
 fi
 "$UV_PROJECT_ENVIRONMENT/bin/python" "$plugin_dir/router.py" initialize
-printf '\nThis installs a rule for the selected remote ONLY, then enables a user-session service.\n'
+printf '\nThis builds the bundled microphone, installs a rule for the selected remote ONLY,\n'
+printf 'then enables the microphone and button-router user-session services.\n'
 printf 'The physical remote is ignored by the desktop even while the service is stopped.\n'
 read -r -p "Apply these machine-local permissions and service changes? [y/N] " answer
 if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
@@ -63,7 +76,7 @@ if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
 fi
 systemctl --user import-environment HYPRLAND_INSTANCE_SIGNATURE WAYLAND_DISPLAY
 "$UV_PROJECT_ENVIRONMENT/bin/python" "$plugin_dir/router.py" install
-printf '\nInput permissions and service are ready. If this is a new Bluetooth bond,\n'
+printf '\nInput permissions, microphone and router services are ready. If this is a new Bluetooth bond,\n'
 printf 'open Shield Remote, hold Home + Back until it blinks, and select Pair remote.\n'
 printf 'For an existing bond, wake it with an arrow and select Reconnect remote,\n'
 printf 'and pair the Shield TV using its on-screen code.\n'
