@@ -19,8 +19,18 @@ Ryde's public GBFS feed through Entur.
 GeoClue sends nearby Wi-Fi access-point information to BeaconDB to determine
 the position. Coordinates are then used locally to select the closest Ryde
 service area and calculate distances; they are not sent to Entur. If GeoClue
-cannot return a result within one kilometre of accuracy, the panel falls back
-to Stavanger city center.
+cannot return a result within one kilometre of accuracy, no default position
+is used. The panel instead offers a place/address search through Entur's
+Norwegian geocoder. Only searches you explicitly submit are sent to Entur.
+
+Select a search result, drag the map to fine-tune the position under the
+crosshair, then choose **Use map center**. The location button in the panel
+header also lets you search or move an existing position. Manual positions
+are labelled and saved locally under
+`~/.local/state/fredrik.ryde-nearby/location.json` (or `$XDG_STATE_HOME`) and
+used for subsequent refreshes and shell restarts. Choose **Use automatic
+location** to clear the override and try GeoClue again. Old cached
+Stavanger-fallback data is ignored.
 
 Qt Location and Ryde's GBFS feed do not provide elevation. The plugin therefore
 caches a broad one-degree SRTM1 terrain tile from the public AWS Terrain Tiles
@@ -68,5 +78,10 @@ while the feed's remaining range is the primary value.
 
 Keyboard controls: arrows or H/J/K/L pan, `+` and `-` zoom, `C` recentres,
 `R` refreshes, `N`/`P` move through scooters, and `X` clears a selection.
-Cached refresh failures and saved-location fallback remain visible without
-hiding otherwise usable map data.
+Cached refresh failures remain visible without hiding otherwise usable map
+data. If automatic positioning fails, the previous position and scooters
+are cleared so they cannot be mistaken for your current location.
+
+Run the location/search regression tests with
+`python -B -m unittest discover -s fredrik.ryde-nearby -p 'test_*.py'`
+from the repository root.

@@ -3,6 +3,7 @@ import QtQuick.Controls
 import Quickshell
 import qs.Commons
 import qs.Ui
+import "PullRequests.js" as PullRequests
 
 Panel {
   id: root
@@ -64,6 +65,19 @@ Panel {
 
   function typeColor(pullRequest) {
     return pullRequest.type === "review" ? root.bar.urgent : Color.accent
+  }
+
+  function reviewColor(status) {
+    if (status === "changes") return root.bar.urgent
+    if (status === "approved") return Color.accent
+    return root.bar.foreground
+  }
+
+  function reviewIcon(status) {
+    if (status === "approved") return "✓"
+    if (status === "changes") return "!"
+    if (status === "unknown") return "?"
+    return "◷"
   }
 
   function scrollWheel(event) {
@@ -227,30 +241,38 @@ Panel {
             required property int index
             readonly property bool startsSection: index === 0
               || root.pullRequests[index - 1].type !== modelData.type
+            readonly property string reviewStatus: PullRequests.reviewStatus(modelData)
+            readonly property color reviewColor: root.reviewColor(reviewStatus)
+            readonly property string stackLabel: PullRequests.stackLabel(modelData)
             width: ListView.view.width
-            height: Style.space(48) + (startsSection ? Style.space(28) : 0)
+            height: rowContent.implicitHeight + Style.space(16)
+              + (startsSection ? Style.space(28) : 0)
 
-            Row {
+            Item {
               visible: delegateRoot.startsSection
               width: parent.width
               height: delegateRoot.startsSection ? Style.space(28) : 0
-              spacing: Style.space(8)
 
-              Text {
-                anchors.verticalCenter: parent.verticalCenter
-                text: root.sectionLabel(delegateRoot.modelData)
-                color: root.typeColor(delegateRoot.modelData)
-                font.family: root.bar.fontFamily
-                font.pixelSize: Style.font.caption
-                font.bold: true
-              }
+              Row {
+                anchors.fill: parent
+                spacing: Style.space(8)
 
-              Rectangle {
-                width: parent.width - parent.children[0].implicitWidth - parent.spacing
-                height: Style.space(1)
-                anchors.verticalCenter: parent.verticalCenter
-                color: root.typeColor(delegateRoot.modelData)
-                opacity: 0.35
+                Text {
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.sectionLabel(delegateRoot.modelData)
+                  color: root.typeColor(delegateRoot.modelData)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Rectangle {
+                  width: parent.width - parent.children[0].implicitWidth - parent.spacing
+                  height: Style.space(1)
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.typeColor(delegateRoot.modelData)
+                  opacity: 0.35
+                }
               }
 
               MouseArea {
@@ -264,7 +286,7 @@ Panel {
               anchors.left: parent.left
               anchors.right: parent.right
               anchors.bottom: parent.bottom
-              height: Style.space(48)
+              height: rowContent.implicitHeight + Style.space(16)
               radius: Math.min(4, Style.cornerRadius)
               color: delegateRoot.index === root.selectedIndex || rowMouse.containsMouse
                 ? Style.hoverFillFor(root.bar.foreground, Color.accent)
@@ -280,6 +302,7 @@ Panel {
               }
 
               Column {
+                id: rowContent
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.verticalCenter: parent.verticalCenter
@@ -290,6 +313,7 @@ Panel {
                 Text {
                   width: parent.width
                   text: delegateRoot.modelData.title
+                  textFormat: Text.PlainText
                   color: root.bar.foreground
                   font.family: root.bar.fontFamily
                   font.pixelSize: Style.font.body
@@ -331,6 +355,42 @@ Panel {
                     elide: Text.ElideRight
                   }
                 }
+
+                Row {
+                  width: parent.width
+                  spacing: Style.space(6)
+
+                  Rectangle {
+                    id: reviewBadge
+                    width: reviewText.implicitWidth + Style.space(10)
+                    height: reviewText.implicitHeight + Style.space(4)
+                    radius: Math.min(4, Style.cornerRadius)
+                    color: Qt.rgba(delegateRoot.reviewColor.r, delegateRoot.reviewColor.g,
+                      delegateRoot.reviewColor.b, 0.12)
+
+                    Text {
+                      id: reviewText
+                      anchors.centerIn: parent
+                      text: root.reviewIcon(delegateRoot.reviewStatus) + " "
+                        + PullRequests.reviewLabel(delegateRoot.reviewStatus)
+                      color: delegateRoot.reviewColor
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                    }
+                  }
+
+                  Text {
+                    visible: delegateRoot.stackLabel !== ""
+                    width: Math.max(0, parent.width - reviewBadge.width - parent.spacing)
+                    anchors.verticalCenter: parent.verticalCenter
+                    text: delegateRoot.stackLabel
+                    textFormat: Text.PlainText
+                    color: Color.accent
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    elide: Text.ElideRight
+                  }
+                }
               }
 
               MouseArea {
@@ -340,6 +400,30 @@ Panel {
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.openPullRequest(delegateRoot.modelData)
                 onWheel: function(wheel) { root.scrollWheel(wheel) }
+
+                ToolTip {
+                  id: stackTooltip
+                  visible: rowMouse.containsMouse && delegateRoot.stackLabel !== ""
+                  delay: 500
+                  text: PullRequests.stackTooltip(delegateRoot.modelData)
+                  width: Math.min(implicitWidth, panel.contentWidth)
+                  padding: Style.space(8)
+
+                  contentItem: Text {
+                    text: stackTooltip.text
+                    textFormat: Text.PlainText
+                    wrapMode: Text.Wrap
+                    color: Color.tooltip.text
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  background: Rectangle {
+                    color: Color.tooltip.background
+                    border.color: Color.tooltip.border
+                    radius: Math.min(4, Style.cornerRadius)
+                  }
+                }
               }
             }
           }

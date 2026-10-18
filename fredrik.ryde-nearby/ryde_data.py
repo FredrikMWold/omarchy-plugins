@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import fcntl
 import gzip
 import json
@@ -13,17 +14,11 @@ import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-FALLBACK = {
-    "lat": 58.9700,
-    "lon": 5.7331,
-    "accuracy": 0,
-    "source": "Saved location",
-    "label": "Stavanger",
-    "isFallback": True,
-}
 ENTUR_BASE = "https://api.entur.io/mobility/v2/gbfs/v3"
+GEOCODER_URL = "https://api.entur.io/geocoder/v1/search"
 ENTUR_HEADERS = {
     "ET-Client-Name": "fredrik-omarchy-ryde-nearby",
     "User-Agent": "fredrik-omarchy-ryde-nearby/1.1",
@@ -48,6 +43,11 @@ CACHE_PATH = (
     / "data.json"
 )
 TERRAIN_CACHE_PATH = CACHE_PATH.parent / "terrain"
+LOCATION_PATH = (
+    Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    / "fredrik.ryde-nearby"
+    / "location.json"
+)
 TERRAIN_BASE_URL = "https://s3.amazonaws.com/elevation-tiles-prod/skadi"
 TERRAIN_VALID_SIZES = {
     1201 * 1201 * 2,
@@ -58,6 +58,79 @@ TERRAIN_SAMPLE_RADIUS_M = 30
 TERRAIN_MAX_SPREAD_M = 10
 TERRAIN_ALLOWANCE_M = 5
 UPHILL_EFFORT_FACTOR = 5000 / 600
+
+
+class LocationUnavailable(RuntimeError):
+    pass
+
+
+def manual_location(lat, lon, label):
+    if not (
+        math.isfinite(lat) and math.isfinite(lon)
+        and -90 <= lat <= 90 and -180 <= lon <= 180
+    ):
+        raise RuntimeError("Choose a valid position on the map")
+    return {
+        "lat": lat,
+        "lon": lon,
+        "accuracy": 0,
+        "source": "Manual location",
+        "label": label.strip() or "Selected position",
+        "isManual": True,
+    }
+
+
+def saved_location():
+    try:
+        payload = json.loads(LOCATION_PATH.read_text())
+        return manual_location(
+            float(payload["lat"]), float(payload["lon"]), payload["label"]
+        )
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        raise RuntimeError(f"Could not read the saved position: {error}") from error
+
+
+def save_location(location):
+    try:
+        LOCATION_PATH.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = LOCATION_PATH.with_suffix(".tmp")
+        temporary_path.write_text(json.dumps(location) + "\n")
+        temporary_path.replace(LOCATION_PATH)
+    except OSError as error:
+        raise RuntimeError(f"Could not save the selected position: {error}") from error
+
+
+def search_locations(query):
+    if not query.strip():
+        raise RuntimeError("Enter a place or address to search")
+    payload = fetch_json(
+        GEOCODER_URL + "?" + urlencode({"text": query.strip(), "size": 5, "lang": "en"})
+    )
+    if not isinstance(payload, dict) or not isinstance(payload.get("features"), list):
+        raise RuntimeError("Entur returned invalid search results")
+    results = []
+    for feature in payload["features"]:
+        if (
+            not isinstance(feature, dict)
+            or not isinstance(feature.get("geometry"), dict)
+            or not isinstance(feature.get("properties"), dict)
+        ):
+            raise RuntimeError("Entur returned invalid search results")
+        coordinates = feature.get("geometry", {}).get("coordinates", [])
+        label = feature.get("properties", {}).get("label")
+        if not (
+            isinstance(coordinates, list) and len(coordinates) >= 2
+            and isinstance(label, str)
+            and all(
+                isinstance(value, (int, float)) and not isinstance(value, bool)
+                for value in coordinates[:2]
+            )
+        ):
+            raise RuntimeError("Entur returned invalid search results")
+        results.append(manual_location(coordinates[1], coordinates[0], label))
+    return {"results": results}
 
 
 def haversine_km(lat1, lon1, lat2, lon2):
@@ -74,13 +147,18 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
 
 def precise_location():
-    agent = None
     try:
         import gi
 
         gi.require_version("Geoclue", "2.0")
         from gi.repository import Geoclue, Gio, GLib
+    except (ImportError, ValueError) as error:
+        raise LocationUnavailable(
+            f"Automatic location unavailable: {error}. Search for a place to set your position."
+        ) from error
 
+    agent = None
+    try:
         bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 
         def agent_registered():
@@ -123,7 +201,7 @@ def precise_location():
             )
         except GLib.Error as error:
             raise RuntimeError(
-                "GeoClue client creation timed out"
+                f"GeoClue could not get a location: {error.message}"
             ) from error
         finally:
             creation_timeout.cancel()
@@ -140,7 +218,7 @@ def precise_location():
                 "accuracy": round(location.props.accuracy),
                 "source": location.props.description or "GeoClue",
                 "label": "Current location",
-                "isFallback": False,
+                "isManual": False,
             }
 
         read_location()
@@ -153,8 +231,10 @@ def precise_location():
             if best[0] is not None and 0 < best[0]["accuracy"] <= 1000:
                 return best[0]
             time.sleep(0.1)
-    except (ImportError, OSError, RuntimeError):
-        pass
+    except (OSError, RuntimeError, GLib.Error) as error:
+        raise LocationUnavailable(
+            f"Automatic location unavailable: {error}. Search for a place to set your position."
+        ) from error
     finally:
         if agent is not None and agent.poll() is None:
             agent.terminate()
@@ -163,7 +243,9 @@ def precise_location():
             except subprocess.TimeoutExpired:
                 agent.kill()
                 agent.wait(timeout=2)
-    return FALLBACK.copy()
+    raise LocationUnavailable(
+        "No accurate location found. Search for a place to set your position."
+    )
 
 
 def fetch_json(url):
@@ -175,6 +257,8 @@ def fetch_json(url):
         raise RuntimeError(f"Entur returned HTTP {error.code}") from error
     except URLError as error:
         raise RuntimeError(f"Could not reach Entur: {error.reason}") from error
+    except OSError as error:
+        raise RuntimeError(f"Could not reach Entur: {error}") from error
     except json.JSONDecodeError as error:
         raise RuntimeError("Entur returned invalid data") from error
 
@@ -410,8 +494,7 @@ def add_elevation_data(location, vehicles):
     }
 
 
-def build_data():
-    location = precise_location()
+def build_data(location):
     lat = location["lat"]
     lon = location["lon"]
     system = min(SYSTEMS, key=lambda item: haversine_km(lat, lon, item[2], item[3]))
@@ -486,15 +569,45 @@ def build_data():
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--search", metavar="QUERY")
+    actions.add_argument("--set-location", nargs=3, metavar=("LAT", "LON", "LABEL"))
+    actions.add_argument("--automatic", action="store_true")
+    args = parser.parse_args()
+    if args.search is not None:
+        try:
+            print(json.dumps(search_locations(args.search)))
+            return 0
+        except RuntimeError as error:
+            print(json.dumps({"error": str(error), "errorCode": "search_failed"}))
+            return 1
+
     runtime_dir = Path(
         os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
     )
     runtime_dir.mkdir(parents=True, exist_ok=True)
     with (runtime_dir / "fredrik.ryde-nearby.lock").open("w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        location = None
         try:
+            if args.automatic:
+                LOCATION_PATH.unlink(missing_ok=True)
+                CACHE_PATH.unlink(missing_ok=True)
+            if args.set_location:
+                try:
+                    lat, lon = map(float, args.set_location[:2])
+                except ValueError as error:
+                    raise RuntimeError("Choose a valid position on the map") from error
+                location = manual_location(lat, lon, args.set_location[2])
+                save_location(location)
+                CACHE_PATH.unlink(missing_ok=True)
+            else:
+                location = saved_location()
+                if location is None:
+                    location = precise_location()
             encoded = json.dumps(
-                build_data(),
+                build_data(location),
                 ensure_ascii=True,
                 separators=(",", ":"),
             )
@@ -503,14 +616,21 @@ def main():
             temporary_path.write_text(encoded + "\n")
             temporary_path.replace(CACHE_PATH)
             print(encoded)
-        except RuntimeError as error:
+        except (RuntimeError, OSError) as error:
+            if isinstance(error, LocationUnavailable):
+                try:
+                    CACHE_PATH.unlink(missing_ok=True)
+                except OSError as cache_error:
+                    print(f"Could not clear the old position cache: {cache_error}", file=sys.stderr)
             message = str(error)
             code = (
-                "outside_service_area"
+                "location_unavailable"
+                if isinstance(error, LocationUnavailable)
+                else "outside_service_area"
                 if message.startswith("No Ryde service area")
                 else "fetch_failed"
             )
-            print(json.dumps({"error": message, "errorCode": code}))
+            print(json.dumps({"error": message, "errorCode": code, "location": location}))
             return 1
     return 0
 

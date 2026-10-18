@@ -3,6 +3,7 @@ import Quickshell
 import Quickshell.Io
 import qs.Commons
 import qs.Ui
+import "PullRequests.js" as PullRequests
 
 BarWidget {
   id: root
@@ -136,13 +137,11 @@ BarWidget {
     var authorFilter = activeQuery.type === "my" ? "author:@me" : "-author:@me"
     var search = String(setting("filter", defaultFilter)).trim()
     if (search !== "") search += " "
-    search += authorFilter + " is:open"
+    search += authorFilter + " is:open is:pr repo:" + activeQuery.repository
     fetchProcess.command = [
-      "gh", "pr", "list",
-      "--repo", activeQuery.repository,
-      "--state", "open",
-      "--search", search,
-      "--json", "number,title,url,author,isDraft"
+      "gh", "api", "graphql",
+      "-f", "query=" + PullRequests.query(),
+      "-f", "search=" + search
     ]
     fetchProcess.running = true
   }
@@ -150,11 +149,10 @@ BarWidget {
   function completeQuery(exitCode) {
     if (exitCode === 0) {
       try {
-        var response = JSON.parse(processOutput || "[]")
+        var response = PullRequests.parseResponse(processOutput)
         var next = refreshResults.slice()
         for (var i = 0; i < response.length; i++) {
           var item = response[i]
-          if (item.isDraft === true) continue
           item.repository = activeQuery.repository
           item.repositoryName = activeQuery.repository.split("/").pop()
           item.type = activeQuery.type
@@ -163,7 +161,7 @@ BarWidget {
         refreshResults = next
       } catch (error) {
         refreshFailed = true
-        errorMessage = "GitHub returned invalid PR data"
+        errorMessage = String(error.message || error)
       }
     } else if (errorMessage === "") {
       refreshFailed = true

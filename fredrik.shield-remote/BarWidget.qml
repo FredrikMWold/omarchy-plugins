@@ -24,6 +24,7 @@ Ui.BarWidget {
     backendState ? backendState.target : "computer"
   readonly property bool opened: remotePanel.opened
   readonly property bool popoutSwitchClosing: remotePanel.popoutSwitchClosing
+  readonly property string voicePhase: backendState && backendState.voice_input ? backendState.voice_input.phase : "idle"
 
   function applyResponse(raw, clearError) {
     var response = JSON.parse(String(raw).trim())
@@ -173,7 +174,7 @@ Ui.BarWidget {
       anchors.fill: parent
       Text {
         anchors.centerIn: parent
-        text: root.target === "shield" ? "󰄛" : "󰍹"
+        text: root.voicePhase === "recording" ? "󰍬" : root.target === "shield" ? "󰄛" : "󰍹"
         color: root.bar.foreground
         font.family: root.bar.fontFamily
         font.pixelSize: Style.font.icon
@@ -201,6 +202,8 @@ Ui.BarWidget {
     iconComponent: statusIcon
     slotSize: Style.bar.iconSlot
     tooltipText: "Shield Remote: " + (root.target === "shield" ? "Shield TV" : "Computer")
+      + (root.voicePhase === "recording" ? " · Recording voice command; Speak once to send"
+        : root.voicePhase === "sending" ? " · Sending voice command" : "")
       + (root.backendState && root.backendState.input.captured ? "" : " (setup/input required)")
     onPressed: function(mouseButton) {
       if (mouseButton === Qt.RightButton)

@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "fredrik.dreame",
+  "name": "Dreame",
+  "version": "0.1.0",
+  "author": "Fredrik",
+  "description": "Android-free Dreamehome cloud status and explicitly confirmed advanced commands",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "Dreame",
+    "description": "Sign in privately, inspect a vacuum, and confirm advanced API commands",
+    "category": "Utilities",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

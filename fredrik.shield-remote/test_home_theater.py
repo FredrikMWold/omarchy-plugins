@@ -390,7 +390,6 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
             "effects": [],
             "reject": False,
             "ignore_focus": False,
-            "ignore_center": False,
             "ignore_fullscreen": False,
         }
         execute = router.run
@@ -405,8 +404,9 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
                 if "hl.dsp.window.move" in command[2]:
                     desktop["clients"][1].update(monitor=0, workspace={"id": 9})
                 elif "hl.dsp.window.center" in command[2]:
-                    if not desktop["ignore_center"]:
-                        desktop["clients"][1]["at"] = [480, 37]
+                    if desktop["clients"][1]["fullscreen"]:
+                        return "info: =[C]:-1: No floating window found"
+                    desktop["clients"][1]["at"] = [480, 37]
                 elif "hl.dsp.window.fullscreen_state" in command[2]:
                     if not desktop["ignore_fullscreen"]:
                         desktop["clients"][1].update(fullscreen=2, at=[0, 0], size=[1920, 1080])
@@ -429,7 +429,6 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["target"], "computer")
         self.assertEqual(desktop["effects"], [
             'hl.dispatch(hl.dsp.window.move({window="address:0x123abc",workspace="9",follow=false}))',
-            'hl.dispatch(hl.dsp.window.center({window="address:0x123abc"}))',
             'hl.dispatch(hl.dsp.window.fullscreen_state({window="address:0x123abc",'
             'action="set",internal=2,client=2}))',
             'hl.dispatch(hl.dsp.focus({window="address:0x123abc"}))',
@@ -444,9 +443,21 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
         async with self.tv_desktop(endpoint) as desktop:
             await self.press(172)
             await self.press(172, 2)
-        self.assertEqual(len(desktop["effects"]), 8)
+        self.assertEqual(len(desktop["effects"]), 6)
         self.assertEqual(desktop["activewindow"]["address"], "0x123abc")
         self.assertEqual(desktop["activewindow"]["fullscreen"], 2)
+
+    async def test_remote_home_refocuses_existing_fullscreen_window_without_centering(self):
+        endpoint = await self.endpoint(active=False)
+        async with self.tv_desktop(endpoint) as desktop:
+            desktop["clients"][1].update(fullscreen=2, at=[0, 0], size=[1920, 1080])
+            await self.press(172)
+            self.assertEqual(desktop["activewindow"]["address"], "0x123abc")
+            self.assertEqual(desktop["activewindow"]["monitor"], 0)
+            self.assertEqual(desktop["activewindow"]["workspace"]["id"], 9)
+            self.assertEqual(desktop["activewindow"]["fullscreen"], 2)
+            self.assertFalse(any("hl.dsp.window.center" in effect
+                                 for effect in desktop["effects"]))
 
     async def test_tv_home_refuses_disconnected_tv_or_ambiguous_owned_windows(self):
         endpoint = await self.endpoint(active=False)
@@ -483,7 +494,6 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_tv_home_rejects_focused_window_that_remains_offscreen(self):
         endpoint = await self.endpoint(active=False)
         async with self.tv_desktop(endpoint) as desktop:
-            desktop["ignore_center"] = True
             desktop["ignore_fullscreen"] = True
             with self.assertRaisesRegex(RuntimeError, "did not make.*visible.*TV workspace"):
                 await self.backend.computer.home()
@@ -491,6 +501,7 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_tv_home_requires_fullscreen_instead_of_reporting_windowed_success(self):
         endpoint = await self.endpoint(active=False)
         async with self.tv_desktop(endpoint) as desktop:
+            desktop["clients"][1]["at"] = [480, 37]
             desktop["ignore_fullscreen"] = True
             with self.assertRaisesRegex(RuntimeError, "did not make.*fullscreen"):
                 await self.backend.computer.home()
@@ -619,7 +630,9 @@ class ComputerSessionTests(unittest.IsolatedAsyncioTestCase):
                                  '{"alt":"recording"}', "", '{"alt":"idle"}', "atvvoice-shield-remote", ""],
                 ) as command:
                     await self.press(217)
+                    await self.backend.flush_speak()
                     await self.press(217)
+                    await self.backend.flush_speak()
                     self.assertTrue(all(
                         call.args[0][0] in ("voxtype", "pactl") for call in command.await_args_list
                     ))

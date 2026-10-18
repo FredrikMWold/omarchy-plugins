@@ -24,6 +24,7 @@ from androidtvremote2 import AndroidTVRemote, CannotConnect, ConnectionClosed, I
 from evdev import InputDevice
 
 from tv_voice import VoiceRemote, stream_microphone
+from voice_input import AudioInput, receiver_command
 
 
 LOG = logging.getLogger("shield-remote")
@@ -507,8 +508,6 @@ class Computer:
         selector = json.dumps("address:" + address)
         await dispatch(
             f'hl.dsp.window.move({{window={selector},workspace="{workspace["id"]}",follow=false}})')
-        if windows[0].get("floating") is True:
-            await dispatch(f"hl.dsp.window.center({{window={selector}}})")
         await dispatch(
             f'hl.dsp.window.fullscreen_state({{window={selector},action="set",internal=2,client=2}})')
         await dispatch(f"hl.dsp.focus({{window={selector}}})")
@@ -807,6 +806,9 @@ class Router:
         self.command_lock = asyncio.Lock()
         self.input_changed = asyncio.Event()
         self.voice_jobs: dict[VoiceStream, asyncio.Task[None]] = {}
+        self.audio_input = AudioInput(paths.config / "voice-receiver.json", paths.runtime, self.notice, self.error)
+        self.speak_pending: asyncio.Task[None] | None = None
+        self.last_speak: float | None = None
 
     @property
     def paired(self) -> bool:
@@ -829,6 +831,7 @@ class Router:
                        "voice_active": bool(self.voice_jobs),
                        "error": self.shield_error},
             "error": self.last_error, "last_key": self.last_key, "last_action": self.last_action,
+            "voice_input": {"phase": self.audio_input.phase},
         }
 
     async def notice(self, message: str) -> None:
@@ -885,6 +888,8 @@ class Router:
             raise RuntimeError("Shield microphone is unavailable; connect the remote and start ATVVoice")
 
     async def toggle_dictation(self) -> None:
+        if self.audio_input.busy or self.voice_jobs:
+            raise RuntimeError("The microphone is in use by another voice request")
         state = await self.dictation_state()
         if state == "recording":
             await run(["voxtype", "record", "stop"])
@@ -945,8 +950,9 @@ class Router:
         return client
 
     def tv_voice_requested(self, client: AndroidTVRemote, stream: VoiceStream) -> None:
-        if self.client is not client or self.target != "shield" or not self.input_captured:
-            LOG.info("Declining TV microphone request outside captured Shield mode")
+        if (self.client is not client or self.target != "shield" or not self.input_captured
+                or self.audio_input.busy or (self.paths.runtime / "dictation-input.json").exists()):
+            LOG.info("Declining TV microphone request: wrong target, uncaptured input, or microphone busy")
             stream.end()
             return
         job = asyncio.create_task(self.tv_voice_loop(client, stream))
@@ -980,7 +986,8 @@ class Router:
         try:
             async with asyncio.timeout(TV_VOICE_TIMEOUT):
                 async with self.routing_lock:
-                    if self.client is not client or self.target != "shield" or not self.input_captured:
+                    if (self.client is not client or self.target != "shield" or not self.input_captured
+                            or self.audio_input.busy or (self.paths.runtime / "dictation-input.json").exists()):
                         return
                     await self.require_remote_microphone()
                 LOG.info("Forwarding remote microphone to app-requested Shield voice session")
@@ -1009,6 +1016,7 @@ class Router:
             raise ValueError("Unknown control target")
         if target == "shield" and not self.paired:
             raise ValueError("Pair the Shield TV in this panel before selecting it")
+        self.cancel_speak()
         await self.computer.cancel_directions()
         await self.release_shield()
         await self.switch_soundbar(target)
@@ -1059,6 +1067,55 @@ class Router:
         if response.get("result") != []:
             raise RuntimeError(f"Soundbar did not confirm the {action}")
 
+    def cancel_speak(self) -> None:
+        if self.speak_pending is not None:
+            self.speak_pending.cancel()
+        self.speak_pending = None
+        self.last_speak = None
+
+    async def flush_speak(self) -> None:
+        pending = self.speak_pending
+        if pending is None:
+            return
+        self.speak_pending = None
+        self.last_speak = None
+        if pending is not None and pending is not asyncio.current_task():
+            pending.cancel()
+        if self.target == "computer":
+            await self.toggle_dictation()
+            self.last_action = "Computer: dictation toggle"
+
+    async def delayed_speak(self) -> None:
+        await asyncio.sleep(0.5)
+        async with self.routing_lock:
+            try:
+                await self.flush_speak()
+            except (OSError, RuntimeError, ValueError) as error:
+                await self.error(str(error))
+
+    async def speak(self, timestamp: float) -> None:
+        if self.audio_input.phase == "recording":
+            self.cancel_speak()
+            self.audio_input.finish()
+            self.last_action = "Voice command: sending"
+            return
+        if self.audio_input.busy:
+            raise RuntimeError("A voice command is being sent; wait before recording another")
+        if self.last_speak is not None and 0 <= timestamp - self.last_speak <= 0.5:
+            self.cancel_speak()
+            if self.voice_jobs or await self.dictation_state() != "idle":
+                raise RuntimeError("Finish the current dictation or TV voice session before recording a command")
+            await self.require_remote_microphone()
+            if self.voice_jobs:
+                raise RuntimeError("Finish the current TV voice session before recording a command")
+            await self.audio_input.start(REMOTE_MIC)
+            self.last_action = "Voice command: recording"
+            return
+        if self.speak_pending is not None:
+            await self.flush_speak()
+        self.last_speak = timestamp
+        self.speak_pending = asyncio.create_task(self.delayed_speak())
+
     async def key(self, code: int, value: int, timestamp: float) -> None:
         async with self.routing_lock:
             self.last_key = f"{code}:{value}"
@@ -1082,11 +1139,14 @@ class Router:
                         self.last_menu = timestamp
                 self.last_action = "Menu reserved for double-press target switching"
                 return
-            computer_dictation = code == 217 and self.target == "computer"
-            if (code in IGNORED and not computer_dictation) or (code == 116 and self.target == "computer"):
+            if code == 217:
+                if value == 1:
+                    await self.speak(timestamp)
+                return
+            if code in IGNORED or (code == 116 and self.target == "computer"):
                 self.last_action = f"Ignored key {code}"
                 return
-            if code not in SHIELD_KEYS and not computer_dictation:
+            if code not in SHIELD_KEYS:
                 raise ValueError(f"Unexpected remote key {code}; it was not forwarded")
             if code in VOLUME_KEYS and self.config.soundbar_host:
                 if value == 2 and time.monotonic() - self.last_volume_completed < 0.12:
@@ -1115,11 +1175,8 @@ class Router:
                     return
                 if 139 in self.pressed and code in FOCUS_DIRECTIONS:
                     self.last_menu = None
-                if computer_dictation:
-                    await self.toggle_dictation()
-                else:
-                    await self.computer.key(code, repeat=value == 2)
-                self.last_action = "Computer: dictation toggle" if computer_dictation else f"Computer: key {code}"
+                await self.computer.key(code, repeat=value == 2)
+                self.last_action = f"Computer: key {code}"
             self.last_error = ""
             self.last_notice = ""
 
@@ -1442,6 +1499,9 @@ class Router:
                 self.input_waiting_for_release = False
                 self.pressed.clear()
                 self.last_menu = None
+                self.cancel_speak()
+                if self.audio_input.phase in ("starting", "recording"):
+                    await self.audio_input.close()
                 try:
                     await self.computer.cancel_directions()
                 except (RuntimeError, OSError) as error:
@@ -1461,6 +1521,16 @@ class Router:
         command = payload.get("command")
         if command == "configure":
             await self.configure(payload.get("values"))
+        elif command == "configure_voice":
+            value = {"version": 1, "command": payload.get("receiver")}
+            file = self.paths.config / "voice-receiver.json"
+            with tempfile.TemporaryDirectory(dir=self.paths.config) as directory:
+                candidate = Path(directory) / "receiver.json"
+                write_private_json(candidate, value)
+                receiver_command(candidate)
+            if self.audio_input.busy:
+                raise RuntimeError("Finish the active voice request before changing its receiver")
+            write_private_json(file, value)
         elif command == "target":
             async with self.routing_lock:
                 await self.select(payload.get("target"))
@@ -1558,9 +1628,11 @@ class Router:
                     if tasks[-1] not in done:
                         raise RuntimeError("A routing worker stopped unexpectedly")
             finally:
+                self.cancel_speak()
                 for task in tasks:
                     task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
+                await self.audio_input.close()
                 try:
                     await self.close_dictation()
                 finally:

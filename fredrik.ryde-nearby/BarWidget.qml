@@ -9,6 +9,7 @@ BarWidget {
   moduleName: "fredrik.ryde-nearby"
 
   property var mapData: null
+  property var location: null
   property string processOutput: ""
   property string processError: ""
   property string errorMessage: ""
@@ -59,14 +60,14 @@ BarWidget {
   readonly property bool indicatorHollow:
     !requirementsReady || !mapData || nearestDistanceKm < 0
       || usingCachedData || refreshFailed
-      || (mapData.location && mapData.location.isFallback)
   readonly property string dataStatusLabel:
     refreshFailed ? " · refresh failed"
-    : mapData && mapData.location && mapData.location.isFallback
-      ? " · using saved location"
+    : location && location.isManual
+      ? " · manual position" + (usingCachedData ? " · cached data" : "")
       : usingCachedData ? " · cached data" : ""
   readonly property string distanceLabel:
     !requirementsReady ? "Ryde setup required"
+    : !location ? (loading ? "Finding your position" : "Set your Ryde position")
     : nearestDistanceKm < 0
       ? "No scooters within 1.5 km" + dataStatusLabel
       : nearestDistanceKm < 1
@@ -89,6 +90,7 @@ BarWidget {
     var target = panelLoader.item
     if (!target) return
     if ("mapData" in target) target.mapData = root.mapData
+    if ("location" in target) target.location = root.location
     if ("loading" in target) target.loading = root.loading
     if ("errorMessage" in target) target.errorMessage = root.errorMessage
     if ("usingCachedData" in target)
@@ -110,10 +112,13 @@ BarWidget {
       if (text === "") return false
       var payload = JSON.parse(text)
       if (!payload || payload.error || !payload.location
+          || payload.location.isFallback
+          || payload.location.source === "Saved location"
           || (!Array.isArray(payload.vehicles)
             && !Array.isArray(payload.markers)))
         return false
       mapData = payload
+      location = payload.location
       usingCachedData = fromCache
       if (fromCache) cacheLoaded = true
       else refreshFailed = false
@@ -222,14 +227,33 @@ BarWidget {
     if (panelLoader.item) panelLoader.item.toggle()
   }
 
-  function refresh() {
+  function refresh(argumentsList) {
     if (!requirementsReady || fetchProcess.running) return
     loading = true
     errorMessage = ""
     processOutput = ""
     processError = ""
+    fetchProcess.command = ["python", root.pluginPath + "/ryde_data.py"]
+      .concat(argumentsList || [])
     syncPanel()
     fetchProcess.running = true
+  }
+
+  function setLocation(lat, lon, label) {
+    if (!requirementsReady || fetchProcess.running) return
+    mapData = null
+    location = {
+      lat: lat, lon: lon, accuracy: 0,
+      label: label, source: "Manual location", isManual: true
+    }
+    refresh(["--set-location", String(lat), String(lon), label])
+  }
+
+  function useAutomaticLocation() {
+    if (!requirementsReady || fetchProcess.running) return
+    mapData = null
+    location = null
+    refresh(["--automatic"])
   }
 
   readonly property bool opened:
@@ -253,6 +277,7 @@ BarWidget {
   onBarChanged: injectPanel()
   onSettingsChanged: injectPanel()
   onMapDataChanged: syncPanel()
+  onLocationChanged: syncPanel()
   onLoadingChanged: syncPanel()
   onErrorMessageChanged: syncPanel()
   onRequirementsDataChanged: syncPanel()
@@ -349,6 +374,19 @@ BarWidget {
       if (exitCode === 0 && root.loadPayload(root.processOutput, false)) {
         root.errorMessage = ""
       } else {
+        try {
+          var failure = JSON.parse(root.processOutput)
+          if ("location" in failure) {
+            if (!failure.location || !root.mapData
+                || Number(root.mapData.location.lat) !== Number(failure.location.lat)
+                || Number(root.mapData.location.lon) !== Number(failure.location.lon))
+              root.mapData = null
+            root.location = failure.location
+          }
+        } catch (error) {
+          root.processError = root.processError.trim()
+            || "The Ryde data process returned invalid data"
+        }
         root.refreshFailed = true
         root.errorMessage = root.payloadError(root.processOutput)
           || root.processError.trim()

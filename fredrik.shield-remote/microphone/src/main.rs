@@ -392,8 +392,8 @@ async fn main() -> anyhow::Result<()> {
 
             let sample_rate = codec.sample_rate();
             let (frame_tx, mut frame_rx) =
-                tokio::sync::mpsc::channel::<protocol::types::AudioFrame>(DECODER_CHANNEL_CAPACITY);
-            let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<Vec<i16>>();
+                tokio::sync::mpsc::channel::<pw::AudioChunk>(DECODER_CHANNEL_CAPACITY);
+            let (pcm_tx, pcm_rx) = std::sync::mpsc::channel::<pw::AudioChunk>();
             let (pw_shutdown_tx, pw_shutdown_rx) =
                 pipewire::channel::channel::<pw::Shutdown>();
 
@@ -423,11 +423,10 @@ async fn main() -> anyhow::Result<()> {
             // Post-processing task: Protocol already decoded the audio,
             // so we just apply declip/lowpass/gain and forward PCM.
             let decoder_handle = tokio::spawn(async move {
-                while let Some(frame) = frame_rx.recv().await {
-                    let mut samples = frame.samples;
-                    adpcm::declip(&mut samples);
-                    adpcm::lowpass(&mut samples);
-                    let _ = pcm_tx.send(samples);
+                while let Some(mut frame) = frame_rx.recv().await {
+                    adpcm::declip(&mut frame.samples);
+                    adpcm::lowpass(&mut frame.samples);
+                    let _ = pcm_tx.send(frame);
                 }
             });
 

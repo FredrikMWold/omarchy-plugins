@@ -28,17 +28,65 @@ to the computer or Shield while a soundbar is configured.
 | Rewind / fast-forward | Active Theater seek, -/+10 seconds; prior supported MPRIS seek otherwise | Native keys; the Shield app decides the interval |
 | Volume | Soundbar, one-step adjustments; default computer output in 5% steps if no soundbar is configured | Soundbar, one-step adjustments; native Shield volume keys if no soundbar is configured |
 | Power | Ignored (never sleeps or shuts down this computer) | Toggle Shield sleep / wake |
-| Microphone/Search | Toggle Omarchy's built-in dictation using the Shield microphone | Button ignored; use the app's on-screen microphone as described below |
+| Speak / Microphone | Single press: toggle dictation after 500 ms. Double press: record a voice command; next press sends it | Single press ignored except to finish a recording. Double press: same voice-command recording |
 | Netflix | Ignored | Ignored |
 
-In Computer mode, press Microphone once to start dictation and again to stop
+In Computer mode, press Speak once to start dictation and again to stop
 and transcribe, just like Omarchy's Super+Ctrl+X shortcut. It temporarily selects
 the Shield microphone as the system default and uses the existing Voxtype
 transcription and output settings, including when Home Theater has focus;
 it no longer dispatches Theater Search. Holding the button, duplicate presses
 without a release, and releasing it do not toggle again. Voxtype must be
 installed and running; command failures use the router's existing error
-notification and panel reporting, never a Search or keyboard fallback.
+notification and panel reporting, never a Search or keyboard fallback. Ordinary
+single presses wait 500 ms so a double press cannot accidentally start dictation.
+
+### Mode-independent voice commands
+
+Double-press **Speak** within 500 ms, wait for the listening notification, speak,
+then press Speak **once** to finish and send. This works in either target without
+changing the target or soundbar input. Capture uses the named Shield microphone
+directly, never changes the default input, and disables PipeWire fallback and
+reconnection. Active dictation, TV voice and command recording cannot overlap.
+Target changes cancel pending double-press detection; disconnects cancel unfinished
+recordings. Explicitly submitted requests can finish after a Bluetooth disconnect.
+The 30-second recording limit **cancels** rather than submitting automatically.
+
+The router knows only how to create a private 16 kHz mono PCM16 WAV and call
+a configured executable with its path appended as the last argument. It has no
+Dreame imports, model schema, account access or cleaning logic. Configure the
+machine-local receiver through its existing socket:
+
+```sh
+printf '%s\n' '{"command":"configure_voice","receiver":["/usr/bin/bash","/home/fredrik/.config/omarchy/plugins/fredrik.dreame/run.sh","audio","--audio-file"]}' |
+  bash ~/omarchy-plugins/fredrik.shield-remote/run.sh request
+```
+
+This stores a private `~/.config/fredrik.shield-remote/voice-receiver.json`,
+separate from the existing target/network configuration. Receiver arguments
+are executed directly, without shell interpolation; the executable must have an
+absolute path. A future automation router only needs to replace this command.
+No intermediary service or new dotfiles/symlink setup is required.
+
+The receiver must return one JSON object with boolean `ok`, optionally a
+user-facing `message` or an `error.message`. It owns transcription and whatever
+action submission authorizes. The configured Dreame receiver uses local Voxtype
+file transcription, handles explicit Stop requests locally through its guarded
+end-and-return-to-dock control, and sends cleaning requests to its existing Luna
+planner for automatic execution after validation. It does not type or touch the clipboard.
+WAVs live in private runtime temporary directories and are removed on success,
+failure or cancellation. Shutdown terminates owned capture/receiver processes.
+Before handoff, the router verifies the finalized WAV's format, duration and
+complete PCM data. PipeWire's normal SIGINT exit code 1 is accepted only after
+an explicit finish, with its normal filename-only stderr and a valid WAV;
+recorder errors still reject the recording.
+The shared microphone daemon clears pending and PipeWire audio at capture
+boundaries and rejects delayed PCM captured before the current recording.
+Previous command audio cannot be carried forward through either decoder queue;
+fresh speech is not removed using a fixed-duration trim. This also isolates
+ordinary single-press dictation recordings.
+There is **no retry** after timeout or unclear acknowledgement: check the
+receiving application's state before submitting again.
 
 Shield presses/releases use the protocol's `START_LONG`/`END_LONG` events.
 Power instead sends one `POWER`/`SHORT` per press, including when held, so it
@@ -109,8 +157,10 @@ first-run output setup is not bypassed. Existing sessions first receive `Raise()
 preserving browsing/playback context and pause.
 When the machine-local **TV output** is configured (for example `HDMI-A-1`),
 Home additionally uses `hyprctl` to move the existing integrated Home Theater
-window to that monitor's currently active workspace, center it when floating,
-explicitly set fullscreen (never toggle it), and focus it. This avoids Qt/Wayland
+window to that monitor's currently active workspace, explicitly set fullscreen
+(never toggle it), and focus it. Fullscreen placement also corrects stale
+off-screen positions without a separate floating-window centering command,
+which Hyprland rejects for already-fullscreen windows. This avoids Qt/Wayland
 activation returning success while the window stays out of view, including stale
 off-screen floating positions.
 The window is identified by the DBus owner's process ID and exact app class,
@@ -166,7 +216,7 @@ Private software validation (no live remote endpoint, Bluetooth or receiver):
 ```sh
 cd ~/omarchy-plugins/fredrik.shield-remote
 TMPDIR="$PWD" ~/.local/share/fredrik.shield-remote/venv/bin/python \
-  -m unittest test_router test_navigation test_home_theater test_restart test_microphone test_tv_voice
+  -m unittest test_router test_navigation test_home_theater test_restart test_microphone test_tv_voice test_voice_input
 omarchy plugin validate ~/omarchy-plugins/fredrik.shield-remote
 ```
 

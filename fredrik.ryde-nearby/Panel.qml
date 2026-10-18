@@ -19,6 +19,16 @@ Panel {
   property bool usingCachedData: false
   property bool refreshFailed: false
   property var mapData: null
+  property var location: null
+  property bool locationEditorOpen: false
+  property var draftLocation: null
+  property var searchResults: []
+  property string searchMessage: ""
+  property string searchOutput: ""
+  property string searchError: ""
+  property bool searchCompleted: false
+  property string searchQuery: ""
+  property var centeredLocation: null
   property bool mapInitialized: false
   property var clusteredMarkers: []
   property var selectedMarker: null
@@ -35,12 +45,10 @@ Panel {
     (Color.background.r * 0.2126
       + Color.background.g * 0.7152
       + Color.background.b * 0.0722) < 0.5
-  readonly property bool fallbackLocation:
-    mapData && mapData.location
-      && (mapData.location.isFallback
-        || mapData.location.source === "Saved location")
+  readonly property bool editingLocation: locationEditorOpen || !location
+  readonly property bool hasMapPosition: location !== null || draftLocation !== null
   readonly property bool showStatusStrip:
-    mapData && (errorMessage !== "" || fallbackLocation)
+    !editingLocation && errorMessage !== ""
   readonly property color secondaryText: Color.muted
   readonly property color successColor:
     paletteColor("green", Color.accent)
@@ -110,11 +118,69 @@ Panel {
   }
 
   function resetMap() {
-    if (!mapData || !mapData.location) return
-    mapView.map.center = coordinate(mapData.location.lat, mapData.location.lon)
+    if (!location) return
+    mapView.map.center = coordinate(location.lat, location.lon)
     mapView.map.zoomLevel = 15.4
     selectedMarker = null
     mapInitialized = true
+    centeredLocation = location
+  }
+
+  function editLocation() {
+    locationEditorOpen = true
+    selectedMarker = null
+    Qt.callLater(function() { locationSearch.forceActiveFocus() })
+  }
+
+  function searchLocations() {
+    if (!hostWidget || searchProcess.running || locationSearch.text.trim() === "") return
+    locationEditorOpen = true
+    searchQuery = locationSearch.text.trim()
+    searchResults = []
+    searchMessage = ""
+    searchOutput = ""
+    searchError = ""
+    searchCompleted = false
+    searchProcess.command = [
+      "python", hostWidget.pluginPath + "/ryde_data.py", "--search", searchQuery
+    ]
+    searchProcess.running = true
+  }
+
+  function previewLocation(result) {
+    locationEditorOpen = true
+    draftLocation = result
+    mapView.map.center = coordinate(result.lat, result.lon)
+    mapView.map.zoomLevel = 16
+    searchResults = []
+    searchCompleted = false
+    locationSearch.focus = false
+    keyCatcher.forceActiveFocus()
+  }
+
+  function saveMapPosition() {
+    if (!hasMapPosition || loading || !hostWidget) return
+    var center = mapView.map.center
+    if (!center.isValid) {
+      searchMessage = "Choose a valid position on the map"
+      return
+    }
+    var label = draftLocation ? draftLocation.label : "Selected position"
+    hostWidget.setLocation(center.latitude, center.longitude, label)
+    locationEditorOpen = false
+    draftLocation = null
+    resetMap()
+    keyCatcher.forceActiveFocus()
+  }
+
+  function cancelLocationEdit() {
+    locationEditorOpen = false
+    draftLocation = null
+    searchResults = []
+    searchMessage = ""
+    searchCompleted = false
+    resetMap()
+    keyCatcher.forceActiveFocus()
   }
 
   function sourceVehicles() {
@@ -174,15 +240,17 @@ Panel {
   }
 
   function locationLabel() {
-    if (!mapData || !mapData.location) return ""
-    if (fallbackLocation) return "Saved location"
-    var accuracy = Number(mapData.location.accuracy || 0)
+    if (!location) return "Position not set"
+    if (location.isManual) return "Manual position"
+    var accuracy = Number(location.accuracy || 0)
     return accuracy > 0
       ? "Location ±" + Math.round(accuracy) + " m"
       : "Current location"
   }
 
   function nearestTitle() {
+    if (!location) return "Set your position"
+    if (!mapData) return loading ? "Finding scooters…" : "Ryde nearby"
     var nearest = nearestVehicle()
     if (!nearest) return "No scooters nearby"
     return "Nearest " + approximateDistance(nearest)
@@ -201,9 +269,9 @@ Panel {
 
   function statusMessage() {
     if (errorMessage !== "")
-      return "Refresh failed · data " + dataAgeLabel()
-    if (fallbackLocation)
-      return "Saved location · not your current position"
+      return mapData
+        ? "Refresh failed · data " + dataAgeLabel()
+        : errorMessage
     return ""
   }
 
@@ -462,8 +530,43 @@ Panel {
 
   onMapDataChanged: {
     reconcileSelection()
-    if (!mapInitialized) resetMap()
+    if (!mapInitialized && !draftLocation) resetMap()
     clusterTimer.restart()
+  }
+
+  onLocationChanged: {
+    if (!location) {
+      mapInitialized = false
+      centeredLocation = null
+    } else if (!draftLocation && (!centeredLocation
+        || Number(centeredLocation.lat) !== Number(location.lat)
+        || Number(centeredLocation.lon) !== Number(location.lon))) {
+      resetMap()
+    }
+  }
+
+  Process {
+    id: searchProcess
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.searchOutput = String(text || "")
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.searchError = String(text || "")
+    }
+    onExited: function(exitCode) {
+      if (locationSearch.text.trim() !== root.searchQuery) return
+      root.searchCompleted = true
+      try {
+        var payload = JSON.parse(root.searchOutput)
+        if (exitCode !== 0 || !Array.isArray(payload.results))
+          throw new Error(payload.error || "Could not search for places")
+        root.searchResults = payload.results
+      } catch (error) {
+        root.searchMessage = root.searchError.trim() || String(error)
+      }
+    }
   }
 
   FileView {
@@ -529,8 +632,10 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: locationSearch.activeFocus
       onCloseRequested: {
-        if (root.selectedMarker) root.selectedMarker = null
+        if (root.locationEditorOpen) root.cancelLocationEdit()
+        else if (root.selectedMarker) root.selectedMarker = null
         else root.close()
       }
       onTabRequested: function(direction) { root.switchPanel(direction) }
@@ -539,7 +644,8 @@ Panel {
         clusterTimer.restart()
       }
       onActivateRequested: {
-        if (!root.selectedMarker) root.selectRelative(1)
+        if (root.editingLocation) root.saveMapPosition()
+        else if (!root.selectedMarker) root.selectRelative(1)
       }
       onDeleteRequested: root.selectedMarker = null
       onTextKey: function(text) {
@@ -636,12 +742,26 @@ Panel {
 
             PanelActionButton {
               size: Style.space(36)
-              iconText: "◎"
+              iconText: "⌖"
               fontSize: Style.font.iconLarge
-              tooltipText: "Center on current location (C)"
+              tooltipText: "Search or move your position"
               foreground: Color.popups.text
               focusable: true
               bordered: true
+              Accessible.name: tooltipText
+              Accessible.role: Accessible.Button
+              onClicked: root.editLocation()
+            }
+
+            PanelActionButton {
+              size: Style.space(36)
+              iconText: "◎"
+              fontSize: Style.font.iconLarge
+              tooltipText: "Center on your position (C)"
+              foreground: Color.popups.text
+              focusable: true
+              bordered: true
+              enabled: root.location !== null
               Accessible.name: tooltipText
               Accessible.role: Accessible.Button
               onClicked: root.resetMap()
@@ -672,9 +792,130 @@ Panel {
           }
         }
 
+        Rectangle {
+          id: locationEditor
+          visible: root.editingLocation
+          anchors.top: header.bottom
+          anchors.left: parent.left
+          anchors.right: parent.right
+          height: visible ? locationControls.implicitHeight + Style.space(20) : 0
+          color: Color.popups.background
+          z: 45
+
+          Column {
+            id: locationControls
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.top: parent.top
+            anchors.margins: Style.space(10)
+            spacing: Style.space(6)
+
+            Text {
+              width: parent.width
+              text: root.loading && !root.location
+                ? "Trying automatic location. You can also search below."
+                : !root.location
+                  ? (root.errorMessage || "Search for a place to set your position.")
+                  : "Search for a place, or drag the map to move your position."
+              wrapMode: Text.WordWrap
+              color: root.secondaryText
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              TextField {
+                id: locationSearch
+                width: parent.width - searchButton.width - parent.spacing
+                placeholderText: "Search a place or address in Norway"
+                foreground: Color.popups.text
+                Accessible.name: "Search for your position"
+                onAccepted: root.searchLocations()
+                onTextChanged: {
+                  root.searchResults = []
+                  root.searchCompleted = false
+                  root.searchMessage = ""
+                }
+                Keys.onEscapePressed: {
+                  focus = false
+                  keyCatcher.forceActiveFocus()
+                }
+              }
+
+              Button {
+                id: searchButton
+                text: searchProcess.running ? "Searching…" : "Search"
+                enabled: !searchProcess.running && locationSearch.text.trim() !== ""
+                onClicked: root.searchLocations()
+              }
+            }
+
+            Text {
+              visible: root.searchMessage !== ""
+                || (root.searchCompleted && root.searchResults.length === 0)
+              width: parent.width
+              text: root.searchMessage || "No places found. Try a more specific address."
+              color: root.searchMessage !== "" ? Color.urgent : root.secondaryText
+              wrapMode: Text.WordWrap
+              font.family: root.bar.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            ListView {
+              visible: root.searchResults.length > 0
+              width: parent.width
+              height: visible
+                ? Math.min(contentHeight, Style.space(96)) : 0
+              clip: true
+              model: root.searchResults
+              delegate: Button {
+                required property var modelData
+                width: ListView.view.width
+                height: Style.space(32)
+                text: modelData.label
+                tooltipText: modelData.label
+                leftAlign: true
+                focusable: true
+                onClicked: root.previewLocation(modelData)
+              }
+            }
+
+            Row {
+              width: parent.width
+              spacing: Style.space(6)
+
+              Button {
+                text: "Use map center"
+                focusable: true
+                visible: root.hasMapPosition
+                enabled: !root.loading
+                onClicked: root.saveMapPosition()
+              }
+              Button {
+                text: "Use automatic location"
+                focusable: true
+                enabled: !root.loading
+                onClicked: {
+                  root.cancelLocationEdit()
+                  if (root.hostWidget) root.hostWidget.useAutomaticLocation()
+                }
+              }
+              Button {
+                text: "Cancel"
+                focusable: true
+                visible: root.location !== null
+                onClicked: root.cancelLocationEdit()
+              }
+            }
+          }
+        }
+
         Item {
           id: mapFrame
-          anchors.top: header.bottom
+          anchors.top: locationEditor.bottom
           anchors.left: parent.left
           anchors.right: parent.right
           anchors.bottom: parent.bottom
@@ -683,8 +924,8 @@ Panel {
           StableMapView {
             id: mapView
             anchors.fill: parent
+            visible: root.hasMapPosition
             map.plugin: mapPlugin
-            map.center: root.coordinate(58.9700, 5.7331)
             map.zoomLevel: 15.4
             map.copyrightsVisible: true
 
@@ -698,7 +939,7 @@ Panel {
                       .toLowerCase().indexOf("custom") !== -1) {
                     mapView.map.activeMapType =
                       mapView.map.supportedMapTypes[i]
-                    root.resetMap()
+                    if (!root.draftLocation) root.resetMap()
                     clusterTimer.restart()
                     break
                   }
@@ -709,15 +950,12 @@ Panel {
 
             MapCircle {
               parent: mapView.map
-              visible: root.mapData && root.mapData.location
-                && root.mapData.location.accuracy > 0
-              center: root.mapData && root.mapData.location
-                ? root.coordinate(
-                  root.mapData.location.lat, root.mapData.location.lon
-                )
-                : root.coordinate(58.9700, 5.7331)
-              radius: root.mapData && root.mapData.location
-                ? root.mapData.location.accuracy : 0
+              visible: root.location !== null && !root.editingLocation
+                && root.location.accuracy > 0
+              center: root.location
+                ? root.coordinate(root.location.lat, root.location.lon)
+                : QtPositioning.coordinate()
+              radius: root.location ? root.location.accuracy : 0
               color: Util.alpha(Color.accent, 0.08)
               border.color: Util.alpha(root.softInfoColor, 0.5)
               border.width: 1
@@ -726,12 +964,10 @@ Panel {
 
             MapQuickItem {
               parent: mapView.map
-              visible: root.mapData && root.mapData.location
-              coordinate: root.mapData && root.mapData.location
-                ? root.coordinate(
-                  root.mapData.location.lat, root.mapData.location.lon
-                )
-                : root.coordinate(58.9700, 5.7331)
+              visible: root.location !== null && !root.editingLocation
+              coordinate: root.location
+                ? root.coordinate(root.location.lat, root.location.lon)
+                : QtPositioning.coordinate()
               anchorPoint.x: locationDot.width / 2
               anchorPoint.y: locationDot.height / 2
               z: 20
@@ -897,7 +1133,7 @@ Panel {
                 ? root.coordinate(
                   root.selectedMarker.lat, root.selectedMarker.lon
                 )
-                : root.coordinate(58.9700, 5.7331)
+                : QtPositioning.coordinate()
               anchorPoint.x: selectedPin.width / 2
               anchorPoint.y: selectedPin.height / 2
               z: 31
@@ -956,6 +1192,31 @@ Panel {
             }
           }
 
+          Text {
+            visible: root.editingLocation && root.hasMapPosition
+            anchors.centerIn: parent
+            text: "+"
+            color: Color.accent
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.iconLarge
+            font.bold: true
+            z: 45
+          }
+
+          Text {
+            visible: root.editingLocation && root.hasMapPosition
+            anchors.top: parent.top
+            anchors.horizontalCenter: parent.horizontalCenter
+            anchors.topMargin: Style.space(8)
+            text: "Drag the map, then use map center"
+            color: Color.popups.text
+            style: Text.Outline
+            styleColor: Color.popups.background
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.caption
+            z: 45
+          }
+
           Rectangle {
             visible: root.showStatusStrip
             anchors.top: parent.top
@@ -1005,7 +1266,7 @@ Panel {
 
           Rectangle {
             id: detailCard
-            visible: root.selectedMarker !== null
+            visible: root.selectedMarker !== null && !root.editingLocation
             anchors.bottom: parent.bottom
             anchors.horizontalCenter: parent.horizontalCenter
             anchors.bottomMargin: Style.space(8)
@@ -1100,7 +1361,7 @@ Panel {
           }
 
           Rectangle {
-            visible: root.mapData && root.mapData.count === 0
+            visible: !root.editingLocation && root.mapData && root.mapData.count === 0
               && root.errorMessage === ""
             anchors.centerIn: parent
             width: Math.min(
@@ -1142,8 +1403,8 @@ Panel {
           }
 
           Rectangle {
-            visible: (root.loading && !root.mapData)
-              || (root.errorMessage !== "" && !root.mapData)
+            visible: !root.editingLocation && ((root.loading && !root.mapData)
+              || (root.errorMessage !== "" && !root.mapData))
             anchors.centerIn: parent
             width: Math.min(
               parent.width - Style.space(48), Style.space(310)

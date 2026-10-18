@@ -7,8 +7,9 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
 use crate::consumer;
-use crate::protocol::types::{AudioFrame, AudioStopReason, CtlEvent, StreamId};
+use crate::protocol::types::{AudioStopReason, CtlEvent, StreamId};
 use crate::protocol::Protocol;
+use crate::pw::AudioChunk;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -88,7 +89,7 @@ pub trait BleDevice: Send {
 
 /// Configuration and channels for a session.
 pub struct SessionConfig<'a> {
-    pub audio_tx: mpsc::Sender<AudioFrame>,
+    pub audio_tx: mpsc::Sender<AudioChunk>,
     pub timeouts: &'a SessionTimeouts,
     pub command_rx: Option<&'a mut mpsc::Receiver<ExternalCommand>>,
     pub state_tx: Option<&'a tokio::sync::watch::Sender<State>>,
@@ -246,6 +247,7 @@ pub async fn run_session(
             }
             Some(data) = rx_stream.next() => {
                 if state == State::Streaming {
+                    let captured_at = std::time::Instant::now();
                     if let Some(frame) = protocol.decode_audio(&data) {
                         // Reset frame timer on every audio frame
                         if frame_timeout_enabled {
@@ -266,7 +268,11 @@ pub async fn run_session(
                         }
                         last_seq = Some(frame.seq);
 
-                        if audio_tx.send(frame).await.is_err() {
+                        let chunk = AudioChunk {
+                            captured_at,
+                            samples: frame.samples,
+                        };
+                        if audio_tx.send(chunk).await.is_err() {
                             tracing::warn!("audio frame dropped: receiver channel full or closed");
                         }
                     }

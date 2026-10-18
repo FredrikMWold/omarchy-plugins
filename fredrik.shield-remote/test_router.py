@@ -44,6 +44,8 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
     async def press(self, code, timestamp=1):
         await self.backend.key(code, 1, timestamp)
         await self.backend.key(code, 0, timestamp + 0.1)
+        if code == 217:
+            await self.backend.flush_speak()
 
     def dictation_commands(self):
         self.audio = {"default": "headset", "state": "idle", "sources": ["headset", "atvvoice-shield-remote"]}
@@ -103,6 +105,8 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.backend.computer = router.Computer()
         with self.dictation_commands() as command:
             await self.backend.key(217, 1, 1)
+            self.assertEqual(self.audio["state"], "idle")
+            await self.backend.flush_speak()
             self.assertEqual(self.audio["default"], "atvvoice-shield-remote")
             self.assertEqual(self.audio["state"], "recording")
             await self.backend.key(217, 1, 1.1)
@@ -137,6 +141,64 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(self.audio["default"], "headset")
         self.backend.client.send_key_command.assert_not_called()
 
+    async def test_single_speak_waits_for_double_press_window(self):
+        self.backend.toggle_dictation = AsyncMock()
+        await self.backend.key(217, 1, 1)
+        self.backend.toggle_dictation.assert_not_awaited()
+        await asyncio.sleep(0.55)
+        self.backend.toggle_dictation.assert_awaited_once()
+
+    async def test_double_speak_records_and_next_press_sends_in_either_mode(self):
+        for target in ("computer", "shield"):
+            with self.subTest(target=target):
+                self.backend.target = target
+                self.backend.audio_input = Mock(busy=False, phase="idle")
+                self.backend.audio_input.start = AsyncMock()
+                self.backend.toggle_dictation = AsyncMock()
+                self.backend.dictation_state = AsyncMock(return_value="idle")
+                self.backend.require_remote_microphone = AsyncMock()
+                await self.backend.key(217, 1, 1)
+                await self.backend.key(217, 0, 1.05)
+                await self.backend.key(217, 1, 1.2)
+                self.backend.audio_input.start.assert_awaited_once_with(router.REMOTE_MIC)
+                self.backend.toggle_dictation.assert_not_awaited()
+                self.backend.audio_input.phase = "recording"
+                await self.backend.key(217, 1, 1.25)
+                await self.backend.key(217, 2, 1.3)
+                self.backend.audio_input.finish.assert_not_called()
+                await self.backend.key(217, 0, 1.4)
+                await self.backend.key(217, 1, 2)
+                self.backend.audio_input.finish.assert_called_once()
+                await self.backend.key(217, 0, 2.1)
+                self.assertEqual(self.backend.target, target)
+
+    async def test_target_change_cancels_pending_speak(self):
+        self.backend.toggle_dictation = AsyncMock()
+        await self.backend.key(217, 1, 1)
+        await self.backend.select("shield")
+        await asyncio.sleep(0.55)
+        self.backend.toggle_dictation.assert_not_awaited()
+        self.assertIsNone(self.backend.last_speak)
+
+    async def test_voice_capture_rejects_competing_dictation_and_tv_audio(self):
+        self.backend.dictation_state = AsyncMock(return_value="recording")
+        self.backend.audio_input.start = AsyncMock()
+        await self.backend.key(217, 1, 1)
+        await self.backend.key(217, 0, 1.1)
+        with self.assertRaisesRegex(RuntimeError, "Finish the current dictation"):
+            await self.backend.key(217, 1, 1.3)
+        self.backend.audio_input.start.assert_not_awaited()
+        self.backend.audio_input.phase = "recording"
+        self.backend.audio_input.task = Mock(done=lambda: False)
+        with self.assertRaisesRegex(RuntimeError, "microphone is in use"):
+            await self.backend.toggle_dictation()
+        self.backend.target = "shield"
+        self.backend.input_captured = True
+        stream = Mock()
+        self.backend.tv_voice_requested(self.backend.client, stream)
+        stream.end.assert_called_once()
+        self.backend.audio_input.task = None
+
     async def test_dictation_failures_are_explicit_without_search_or_key_fallback(self):
         self.backend.computer = router.Computer()
         for error in (FileNotFoundError("voxtype missing"), RuntimeError("Voxtype daemon unavailable")):
@@ -144,11 +206,27 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 router, "run", new_callable=AsyncMock, side_effect=error,
             ) as command:
                 with self.assertRaises(type(error)) as raised:
-                    await self.backend.key(217, 1, 1)
+                    await self.press(217)
                 self.assertIs(raised.exception, error)
                 await self.backend.key(217, 0, 2)
                 command.assert_awaited_once_with(["voxtype", "status", "--format", "json"])
         self.backend.client.send_key_command.assert_not_called()
+
+    async def test_tv_request_during_microphone_preflight_cannot_overlap_recording(self):
+        self.backend.target = "shield"
+        self.backend.input_captured = True
+        self.backend.tv_voice_loop = AsyncMock()
+        self.backend.audio_input.start = AsyncMock()
+        async def microphone():
+            self.backend.tv_voice_requested(self.backend.client, Mock())
+        self.backend.require_remote_microphone = microphone
+        self.backend.dictation_state = AsyncMock(return_value="idle")
+        await self.backend.key(217, 1, 1)
+        await self.backend.key(217, 0, 1.1)
+        with self.assertRaisesRegex(RuntimeError, "current TV voice session"):
+            await self.backend.key(217, 1, 1.2)
+        self.backend.audio_input.start.assert_not_awaited()
+        await self.backend.close_tv_voice()
 
     async def test_keyboard_cancel_restores_input_without_another_remote_press(self):
         with self.dictation_commands():

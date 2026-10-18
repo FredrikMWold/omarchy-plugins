@@ -8,7 +8,8 @@
 //! and normal Rust drop order handles teardown after `mainloop.run()` returns.
 
 use std::io;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
+use std::time::Instant;
 
 use pipewire::context::ContextRc;
 use pipewire::keys;
@@ -32,6 +33,39 @@ const SAMPLE_SIZE: usize = std::mem::size_of::<i16>();
 #[derive(Debug)]
 pub struct Shutdown;
 
+/// Capture time must survive decoder backpressure, not be reassigned at delivery.
+#[derive(Debug)]
+pub struct AudioChunk {
+    pub captured_at: Instant,
+    pub samples: Vec<i16>,
+}
+
+#[derive(Default)]
+struct CaptureBuffer {
+    started_at: Option<Instant>,
+    samples: Vec<i16>,
+}
+
+impl CaptureBuffer {
+    fn reset(&mut self, started_at: Option<Instant>) {
+        self.started_at = started_at;
+        self.samples.clear();
+    }
+
+    fn receive_available(&mut self, audio_rx: &mpsc::Receiver<AudioChunk>, gain: f32) {
+        for mut frame in audio_rx.try_iter() {
+            if !self
+                .started_at
+                .is_some_and(|started_at| frame.captured_at >= started_at)
+            {
+                continue;
+            }
+            crate::adpcm::apply_gain_linear(&mut frame.samples, gain);
+            self.samples.extend_from_slice(&frame.samples);
+        }
+    }
+}
+
 /// Run the PipeWire audio source on the current thread (blocking).
 ///
 /// Reads decoded PCM frames from `audio_rx` and pushes them to PipeWire as a
@@ -39,7 +73,7 @@ pub struct Shutdown;
 ///
 /// Call from a dedicated `std::thread::spawn`.
 pub fn run_pw_source(
-    audio_rx: mpsc::Receiver<Vec<i16>>,
+    audio_rx: mpsc::Receiver<AudioChunk>,
     gain_db: f32,
     sample_rate: u32,
     node_name: &str,
@@ -87,14 +121,14 @@ pub fn run_pw_source(
     // Give the shutdown handler a reference to the stream.
     *stream_slot.borrow_mut() = Some(stream.clone());
 
-    // Buffer of pending PCM samples not yet consumed by PipeWire callbacks.
-    let pending: std::cell::RefCell<Vec<i16>> = std::cell::RefCell::new(Vec::new());
+    // State notifications and RT processing may run on different PipeWire threads.
+    let pending = Arc::new(Mutex::new(CaptureBuffer::default()));
 
     // Precompute linear gain multiplier outside the RT callback to avoid
     // recomputing powf() on every frame.
     let gain_linear = 10f32.powf(gain_db / 20.0);
 
-    /// Maximum pending samples before overflow truncation (~500ms at 16kHz).
+    /// Maximum pending samples before overflow truncation (1s at 8kHz, 0.5s at 16kHz).
     const MAX_PENDING: usize = 8000;
 
     // Track our PipeWire node ID once the stream reaches Paused/Streaming.
@@ -106,8 +140,29 @@ pub fn run_pw_source(
         .state_changed({
             let our_node_id = our_node_id.clone();
             let stream_for_id = stream.clone();
+            let pending = pending.clone();
             move |_, _, old, new| {
                 tracing::debug!("PipeWire stream state: {old:?} -> {new:?}");
+                if matches!(new, pipewire::stream::StreamState::Streaming) {
+                    if !matches!(old, pipewire::stream::StreamState::Streaming) {
+                        pending
+                            .lock()
+                            .expect("audio capture buffer poisoned")
+                            .reset(Some(Instant::now()));
+                    }
+                } else {
+                    pending
+                        .lock()
+                        .expect("audio capture buffer poisoned")
+                        .reset(None);
+                    if matches!(old, pipewire::stream::StreamState::Streaming)
+                        && matches!(new, pipewire::stream::StreamState::Paused)
+                    {
+                        if let Err(error) = stream_for_id.flush(false) {
+                            tracing::error!("Could not flush completed audio capture: {error}");
+                        }
+                    }
+                }
                 if matches!(
                     new,
                     pipewire::stream::StreamState::Paused
@@ -125,18 +180,9 @@ pub fn run_pw_source(
             // NOTE: Vec operations (extend, drain) allocate inside this RT callback.
             // At ~30 fps with 257 samples/frame, allocation pressure is negligible
             // and not a real-time concern for voice audio rates.
-            let mut buf = pending.borrow_mut();
-
-            loop {
-                match audio_rx.try_recv() {
-                    Ok(mut frame) => {
-                        crate::adpcm::apply_gain_linear(&mut frame, gain_linear);
-                        buf.extend_from_slice(&frame);
-                    }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => break,
-                }
-            }
+            let mut capture = pending.lock().expect("audio capture buffer poisoned");
+            capture.receive_available(&audio_rx, gain_linear);
+            let buf = &mut capture.samples;
 
             // Bound pending buffer to prevent unbounded growth under backpressure.
             if buf.len() > MAX_PENDING {
@@ -422,4 +468,77 @@ pub fn run_pw_source(
 
     tracing::info!("PipeWire source stopped");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn chunk(captured_at: Instant, value: i16) -> AudioChunk {
+        AudioChunk {
+            captured_at,
+            samples: vec![value; 160],
+        }
+    }
+
+    #[test]
+    fn new_capture_discards_the_previous_partial_buffer() {
+        let (tx, rx) = mpsc::channel();
+        let mut buffer = CaptureBuffer::default();
+        let first = Instant::now();
+        buffer.reset(Some(first));
+        tx.send(chunk(first, 10000)).unwrap();
+        buffer.receive_available(&rx, 1.0);
+        buffer.samples.drain(..80);
+        buffer.reset(None);
+
+        let second = first + Duration::from_secs(1);
+        buffer.reset(Some(second));
+        tx.send(chunk(second, 2000)).unwrap();
+        buffer.receive_available(&rx, 1.0);
+        assert_eq!(buffer.samples, vec![2000; 160]);
+    }
+
+    #[test]
+    fn new_capture_rejects_old_queued_audio() {
+        let (tx, rx) = mpsc::channel();
+        let first = Instant::now();
+        let second = first + Duration::from_secs(1);
+        tx.send(chunk(first, 10000)).unwrap();
+        tx.send(chunk(second, 2000)).unwrap();
+        let mut buffer = CaptureBuffer::default();
+        buffer.reset(Some(second));
+        buffer.receive_available(&rx, 1.0);
+        assert_eq!(buffer.samples, vec![2000; 160]);
+    }
+
+    #[test]
+    fn delayed_decoder_audio_cannot_enter_a_new_capture() {
+        let (tx, rx) = mpsc::channel();
+        let first = Instant::now();
+        let delayed = chunk(first, 10000);
+        let second = first + Duration::from_secs(1);
+        let mut buffer = CaptureBuffer::default();
+        buffer.reset(Some(second));
+        tx.send(chunk(second, 2000)).unwrap();
+        buffer.receive_available(&rx, 1.0);
+        tx.send(delayed).unwrap();
+        buffer.receive_available(&rx, 1.0);
+        assert_eq!(buffer.samples, vec![2000; 160]);
+    }
+
+    #[test]
+    fn inactive_capture_does_not_accumulate_audio() {
+        let (tx, rx) = mpsc::channel();
+        let mut buffer = CaptureBuffer::default();
+        let now = Instant::now();
+        buffer.reset(Some(now));
+        tx.send(chunk(now, 10000)).unwrap();
+        buffer.receive_available(&rx, 1.0);
+        buffer.reset(None);
+        tx.send(chunk(now + Duration::from_secs(1), 10000)).unwrap();
+        buffer.receive_available(&rx, 1.0);
+        assert!(buffer.samples.is_empty());
+    }
 }

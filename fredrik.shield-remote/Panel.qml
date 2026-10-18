@@ -83,9 +83,17 @@ Ui.Panel {
           }
           Text {
             width: parent.width
-            text: "Double-press Menu to switch targets. Computer Home opens or raises Home Theater. Microphone toggles Omarchy dictation using the remote mic in Computer mode, temporarily switching the default input until recording stops. In Shield mode, use the app's on-screen microphone: it streams the remote mic for up to 30 seconds without launching Assistant. While Theater owns focus, directions, Select, Back and media use its session controls, never another player on error. Other focused apps keep prior navigation. Shield Power toggles sleep/wake."
+            text: "Double-press Menu to switch targets. Double-press Speak in either mode to record a voice command; press Speak once more to send it. A single Speak press in Computer mode still toggles dictation after the 500 ms double-press window. Computer Home opens Home Theater. For Shield app voice search, use the app's on-screen microphone. Shield Power toggles sleep/wake."
             color: Color.muted
             wrapMode: Text.WordWrap
+            font.family: root.bar.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+          Text {
+            visible: root.backend && root.backend.voice_input
+            width: parent.width
+            text: root.backend && root.backend.voice_input ? "Voice command: " + root.backend.voice_input.phase : ""
+            color: Color.accent
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
