@@ -4,6 +4,7 @@ import Quickshell.Io
 import qs.Commons
 import qs.Ui
 import "PullRequests.js" as PullRequests
+import "Repositories.js" as Repositories
 
 BarWidget {
   id: root
@@ -22,6 +23,13 @@ BarWidget {
   property bool refreshFailed: false
   property bool cacheLoaded: false
   property bool hasCompletedRefresh: false
+  property var repositorySettings: null
+  property var pendingRepositorySettings: null
+  property bool repositorySettingsLoaded: false
+  property bool savingRepositories: false
+  property string repositorySettingsError: ""
+  property int repositoryRevision: 0
+  property int refreshRepositoryRevision: 0
 
   readonly property var defaultMyRepositories: [
     "equinor/prisma-decision-web",
@@ -39,14 +47,60 @@ BarWidget {
   readonly property string defaultFilter: "-label:dependencies -label:\"autorelease: pending\""
   readonly property string cacheHome: Quickshell.env("XDG_CACHE_HOME") || Quickshell.env("HOME") + "/.cache"
   readonly property string cachePath: cacheHome + "/fredrik-github-prs.json"
+  readonly property string configHome: Quickshell.env("XDG_CONFIG_HOME") || Quickshell.env("HOME") + "/.config"
+  readonly property string repositorySettingsPath: configHome + "/omarchy/github-prs-repositories.json"
   readonly property int myCount: countForType("my")
   readonly property int reviewCount: countForType("review")
   readonly property bool showLoading: loading && cacheLoaded && pullRequests.length === 0
   readonly property int refreshMinutes: Math.max(1, parseInt(setting("refreshMinutes", 5), 10) || 5)
 
   function repositories(name, fallback) {
+    if (repositorySettings) return repositorySettings[name]
     var configured = setting(name, fallback)
     return configured && configured.length !== undefined ? configured : fallback
+  }
+
+  function applyRepositorySettings(value) {
+    var changed = JSON.stringify(repositorySettings) !== JSON.stringify(value)
+    repositorySettings = value
+    repositorySettingsLoaded = true
+    if (changed || refreshQueued) {
+      repositoriesChanged()
+    }
+  }
+
+  function loadRepositorySettings(raw) {
+    try {
+      var value = Repositories.parseSettings(raw)
+      repositorySettingsError = ""
+      applyRepositorySettings(value)
+    } catch (error) {
+      repositorySettingsError = "Could not read repository settings: " + String(error.message || error)
+      repositorySettingsLoaded = true
+      refresh()
+    }
+  }
+
+  function repositoriesChanged() {
+    repositoryRevision++
+    pullRequests = Repositories.filterPullRequests(pullRequests,
+      repositories("myRepositories", defaultMyRepositories),
+      repositories("reviewRepositories", defaultReviewRepositories))
+    refresh()
+  }
+
+  function saveRepositories(my, review) {
+    if (savingRepositories) return
+    try {
+      pendingRepositorySettings = Repositories.selections(my, review)
+      repositorySettingsError = ""
+      savingRepositories = true
+      repositorySettingsFile.setText(JSON.stringify(pendingRepositorySettings, null, 2) + "\n")
+    } catch (error) {
+      savingRepositories = false
+      pendingRepositorySettings = null
+      repositorySettingsError = "Could not save repositories: " + String(error.message || error)
+    }
   }
 
   function countForType(type) {
@@ -83,7 +137,13 @@ BarWidget {
         cached.push(item)
       }
 
-      if (!hasCompletedRefresh) pullRequests = cached
+      if (!hasCompletedRefresh) {
+        pullRequests = repositorySettingsLoaded
+          ? Repositories.filterPullRequests(cached,
+            repositories("myRepositories", defaultMyRepositories),
+            repositories("reviewRepositories", defaultReviewRepositories))
+          : cached
+      }
     } catch (error) {
       console.warn("github-prs: cache parse failed:", error)
     }
@@ -100,11 +160,13 @@ BarWidget {
   }
 
   function refresh() {
-    if (fetchProcess.running) {
+    if (!repositorySettingsLoaded || loading) {
       refreshQueued = true
       return
     }
 
+    refreshQueued = false
+    refreshRepositoryRevision = repositoryRevision
     refreshResults = []
     queryQueue = []
     errorMessage = ""
@@ -116,6 +178,11 @@ BarWidget {
   }
 
   function runNextQuery() {
+    if (refreshRepositoryRevision !== repositoryRevision) {
+      loading = false
+      refresh()
+      return
+    }
     if (queryQueue.length === 0) {
       if (!refreshFailed || pullRequests.length === 0) {
         pullRequests = refreshResults
@@ -147,6 +214,11 @@ BarWidget {
   }
 
   function completeQuery(exitCode) {
+    if (refreshRepositoryRevision !== repositoryRevision) {
+      loading = false
+      refresh()
+      return
+    }
     if (exitCode === 0) {
       try {
         var response = PullRequests.parseResponse(processOutput)
@@ -190,7 +262,9 @@ BarWidget {
     target.pullRequests = root.pullRequests
     target.loading = root.loading
     target.cacheReady = root.cacheLoaded
-    target.errorMessage = root.errorMessage
+    target.errorMessage = root.repositorySettingsError || root.errorMessage
+    target.repositorySaveError = root.repositorySettingsError
+    target.savingRepositories = root.savingRepositories
     target.myCount = root.myCount
     target.reviewCount = root.reviewCount
   }
@@ -213,12 +287,14 @@ BarWidget {
   onSettingsChanged: {
     injectPanel()
     refreshTimer.restart()
-    refresh()
+    repositoriesChanged()
   }
   onPullRequestsChanged: syncPanel()
   onLoadingChanged: syncPanel()
   onCacheLoadedChanged: syncPanel()
   onErrorMessageChanged: syncPanel()
+  onRepositorySettingsErrorChanged: syncPanel()
+  onSavingRepositoriesChanged: syncPanel()
 
   Loader {
     id: panelLoader
@@ -228,6 +304,37 @@ BarWidget {
     onLoaded: {
       root.injectPanel()
       Qt.callLater(root.injectPanel)
+    }
+  }
+
+  FileView {
+    id: repositorySettingsFile
+    path: root.repositorySettingsPath
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: root.loadRepositorySettings(text())
+    onLoadFailed: function(error) {
+      if (error === FileViewError.FileNotFound) {
+        root.repositorySettingsError = ""
+        root.applyRepositorySettings(null)
+      } else {
+        root.repositorySettingsLoaded = true
+        root.repositorySettingsError = "Could not read repository settings: " + FileViewError.toString(error)
+        root.refresh()
+      }
+    }
+    onSaved: {
+      root.applyRepositorySettings(root.pendingRepositorySettings)
+      root.pendingRepositorySettings = null
+      root.savingRepositories = false
+      if (panelLoader.item) panelLoader.item.finishRepositorySave()
+    }
+    onSaveFailed: function(error) {
+      root.savingRepositories = false
+      root.pendingRepositorySettings = null
+      root.repositorySettingsError = "Could not save repositories: " + FileViewError.toString(error)
     }
   }
 
@@ -271,7 +378,7 @@ BarWidget {
     text: root.showLoading
       ? " loading"
       : " my " + root.myCount + " | review " + root.reviewCount
-    tooltipText: root.errorMessage !== "" ? root.errorMessage : "GitHub pull requests"
+    tooltipText: root.repositorySettingsError || root.errorMessage || "GitHub pull requests"
     fontSize: Style.font.baseSize
 
     onPressed: function(mouseButton) {

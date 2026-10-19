@@ -19,6 +19,9 @@ Panel {
   property int myCount: 0
   property int reviewCount: 0
   property int selectedIndex: -1
+  property bool editingRepositories: false
+  property bool savingRepositories: false
+  property string repositorySaveError: ""
 
   readonly property var barIdentity: hostWidget || root
 
@@ -33,6 +36,24 @@ Panel {
   }
 
   function close() { root.controller.hide() }
+
+  function showRepositories() {
+    if (!hostWidget) return
+    editingRepositories = true
+    repositoryPicker.begin(
+      hostWidget.repositories("myRepositories", hostWidget.defaultMyRepositories),
+      hostWidget.repositories("reviewRepositories", hostWidget.defaultReviewRepositories))
+  }
+
+  function finishRepositorySave() {
+    editingRepositories = false
+    keyCatcher.forceActiveFocus()
+  }
+
+  function cancelRepositoryEditing() {
+    editingRepositories = false
+    keyCatcher.forceActiveFocus()
+  }
 
   function moveSelection(delta) {
     if (pullRequests.length === 0) return
@@ -123,18 +144,23 @@ Panel {
     owner: root.barIdentity
     bar: root.bar
     open: root.opened
-    focusTarget: keyCatcher
+    focusTarget: root.editingRepositories ? repositoryPicker.focusItem : keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(500))
-    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight, Style.space(400))
+    contentHeight: panel.fittedContentHeight(contentColumn.implicitHeight,
+      Style.space(root.editingRepositories ? 520 : 400))
 
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
+      blocked: root.editingRepositories
       onMoveRequested: function(dx, dy) { if (dy !== 0) root.moveSelection(dy) }
       onActivateRequested: root.activateSelection()
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
-      onTextKey: function(text) { if (text === "r" || text === "R") root.refresh() }
+      onTextKey: function(text) {
+        if (text === "r" || text === "R") root.refresh()
+        else if (text === ",") root.showRepositories()
+      }
 
       Column {
         id: contentColumn
@@ -146,9 +172,9 @@ Panel {
           spacing: Style.space(8)
 
           Text {
-            width: parent.width - refreshButton.width - parent.spacing
+            width: parent.width - refreshButton.width - repositoryButton.width - parent.spacing * 2
             anchors.verticalCenter: parent.verticalCenter
-            text: "GitHub pull requests"
+            text: root.editingRepositories ? "GitHub repositories" : "GitHub pull requests"
             color: root.bar.foreground
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.title
@@ -156,7 +182,24 @@ Panel {
           }
 
           Button {
+            id: repositoryButton
+            anchors.verticalCenter: parent.verticalCenter
+            iconText: root.editingRepositories ? "←" : ""
+            enabled: !root.savingRepositories
+            tooltipText: root.editingRepositories ? "Back to pull requests" : "Choose repositories (,)"
+            foreground: root.bar.foreground
+            fontFamily: root.bar.fontFamily
+            horizontalPadding: Style.spacing.controlPaddingX
+            verticalPadding: Style.space(4)
+            onClicked: {
+              if (root.editingRepositories) root.cancelRepositoryEditing()
+              else root.showRepositories()
+            }
+          }
+
+          Button {
             id: refreshButton
+            visible: !root.editingRepositories
             anchors.verticalCenter: parent.verticalCenter
             iconText: root.loading ? "󰦖" : ""
             iconSpinning: root.loading
@@ -170,6 +213,7 @@ Panel {
         }
 
         Text {
+          visible: !root.editingRepositories
           width: parent.width
           text: root.myCount + " yours · " + root.reviewCount + " to review"
           color: Qt.darker(root.bar.foreground, 1.35)
@@ -181,8 +225,22 @@ Panel {
           foreground: root.bar.foreground
         }
 
+        RepositoryPicker {
+          id: repositoryPicker
+          visible: root.editingRepositories
+          width: parent.width
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+          persistenceError: root.repositorySaveError
+          saving: root.savingRepositories
+          onSaveRequested: function(my, review) {
+            if (root.hostWidget) root.hostWidget.saveRepositories(my, review)
+          }
+          onCancelled: root.cancelRepositoryEditing()
+        }
+
         Text {
-          visible: root.errorMessage !== ""
+          visible: !root.editingRepositories && root.errorMessage !== ""
           width: parent.width
           text: root.errorMessage
           color: root.bar.urgent
@@ -192,7 +250,7 @@ Panel {
         }
 
         Text {
-          visible: root.loading && root.cacheReady && root.pullRequests.length === 0
+          visible: !root.editingRepositories && root.loading && root.cacheReady && root.pullRequests.length === 0
           width: parent.width
           text: "Loading pull requests…"
           color: root.bar.foreground
@@ -201,7 +259,7 @@ Panel {
         }
 
         Text {
-          visible: !root.loading && root.pullRequests.length === 0 && root.errorMessage === ""
+          visible: !root.editingRepositories && !root.loading && root.pullRequests.length === 0 && root.errorMessage === ""
           width: parent.width
           text: "No matching pull requests"
           color: root.bar.foreground
@@ -213,7 +271,7 @@ Panel {
           id: pullRequestList
           readonly property real wheelStepSize: Style.space(60)
           property real wheelTargetY: contentY
-          visible: root.pullRequests.length > 0
+          visible: !root.editingRepositories && root.pullRequests.length > 0
           width: parent.width
           height: Math.min(contentHeight, Style.space(280))
           spacing: 0
