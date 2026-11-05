@@ -27,9 +27,11 @@ class VoiceInputTests(unittest.IsolatedAsyncioTestCase):
             from pathlib import Path
             base = Path(os.environ["AUDIO_FIXTURE"])
             (base / "capture.json").write_text(json.dumps(sys.argv[1:]))
+            (base / "capture.pid").write_text(str(os.getpid()))
             if os.environ.get("CAPTURE_FAIL"):
                 sys.exit(1)
-            print(sys.argv[-1], file=sys.stderr, flush=True)
+            if not os.environ.get("CAPTURE_QUIET"):
+                print(sys.argv[-1], file=sys.stderr, flush=True)
             audio = wave.open(sys.argv[-1], "wb")
             audio.setparams((1, 2, 16000, 0, "NONE", "not compressed"))
             audio.writeframes(b"\\x64\\x00" * 16000)
@@ -116,10 +118,21 @@ class VoiceInputTests(unittest.IsolatedAsyncioTestCase):
         self.audio.error.assert_not_awaited()
         self.assertTrue((self.base / "received.json").exists())
 
+    async def test_pipewire_quiet_sigint_exit_one_with_complete_wav_is_delivered(self):
+        with patch.dict(os.environ, {"CAPTURE_STOP_CODE": "1", "CAPTURE_QUIET": "1"}):
+            await self.audio.start("atvvoice-shield-remote")
+            self.audio.finish()
+            await asyncio.wait_for(self.audio.task, 3)
+        self.assertEqual(self.audio.phase, "accepted")
+        self.audio.error.assert_not_awaited()
+        self.assertTrue((self.base / "received.json").exists())
+
     async def test_recorder_errors_are_not_treated_as_clean_sigint(self):
         for environment in (
             {"CAPTURE_STOP_CODE": "1", "CAPTURE_STOP_ERROR": "1"},
+            {"CAPTURE_STOP_CODE": "1", "CAPTURE_STOP_ERROR": "1", "CAPTURE_QUIET": "1"},
             {"CAPTURE_STOP_CODE": "2"},
+            {"CAPTURE_STOP_CODE": "2", "CAPTURE_QUIET": "1"},
         ):
             with self.subTest(environment=environment), patch.dict(os.environ, environment):
                 await self.audio.start("atvvoice-shield-remote")
@@ -129,8 +142,8 @@ class VoiceInputTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse((self.base / "received.json").exists())
 
     async def test_truncated_wav_is_never_sent_after_an_explicit_stop(self):
-        for code in ("0", "1"):
-            with self.subTest(code=code), patch.dict(os.environ, {"CAPTURE_STOP_CODE": code, "CAPTURE_TRUNCATE": "1"}):
+        for code, quiet in (("0", ""), ("1", ""), ("1", "1")):
+            with self.subTest(code=code, quiet=quiet), patch.dict(os.environ, {"CAPTURE_STOP_CODE": code, "CAPTURE_TRUNCATE": "1", "CAPTURE_QUIET": quiet}):
                 (self.base / "received.json").unlink(missing_ok=True)
                 await self.audio.start("atvvoice-shield-remote")
                 self.audio.finish()
@@ -200,3 +213,112 @@ class VoiceInputTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(invalid=invalid), self.assertRaises((ValueError, RuntimeError)):
                 await backend.mutate({"command": "configure_voice", "receiver": invalid})
         self.assertEqual(voice_input.receiver_command(self.config), self.command)
+
+    async def configure_shared_receiver(self):
+        self.receiver.write_text(textwrap.dedent("""
+            import json, os, sys
+            from pathlib import Path
+            base = Path(os.environ["AUDIO_FIXTURE"])
+            def response(value):
+                print(json.dumps(value), flush=True)
+            if "--abort-capture" in sys.argv:
+                response({"ok": True})
+                sys.exit(0)
+            assert not (base / "capture.json").exists()
+            if os.environ.get("RECEIVER_REJECT"):
+                response({"ok": False, "error": {"code": "resource_busy"}})
+                sys.exit(0)
+            capture = {
+                name: sys.argv[sys.argv.index("--" + name.replace("_", "-")) + 1]
+                for name in ("lease_id", "job_id", "request_id")
+            }
+            capture.update(source="shield", pcm_digest="")
+            response({"ok": True, "capture": capture})
+            request = json.loads(sys.stdin.readline())
+            try:
+                os.kill(int((base / "capture.pid").read_text()), 0)
+            except ProcessLookupError:
+                pass
+            else:
+                raise RuntimeError("capture must drain before handoff or abort")
+            if request["action"] == "submit":
+                assert Path(request["audio_file"]).is_file()
+            (base / "shared.json").write_text(json.dumps(request))
+            response({"ok": True, "message": "Shared fixture accepted"})
+        """))
+        backend = router.Router(self.paths, router.Config())
+        await backend.mutate({
+            "command": "configure_voice", "receiver": self.command,
+            "activation": "hold", "ownership": "shared-recognition",
+        })
+
+    async def test_shared_hold_configuration_requires_explicit_ownership(self):
+        backend = router.Router(self.paths, router.Config())
+        original = self.config.read_bytes()
+        for values in (
+            {"activation": "hold"}, {"activation": "unknown"},
+            {"activation": "hold", "ownership": "unknown"},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                await backend.mutate({
+                    "command": "configure_voice", "receiver": self.command, **values,
+                })
+            self.assertEqual(self.config.read_bytes(), original)
+        await self.configure_shared_receiver()
+        self.assertTrue(self.audio.hold_enabled)
+        self.assertEqual(voice_input.receiver_command(self.config), self.command)
+
+    async def test_shared_capture_admits_before_recording_and_submits_finalized_audio(self):
+        await self.configure_shared_receiver()
+        await self.audio.start("atvvoice-shield-remote")
+        self.assertFalse((self.base / "shared.json").exists())
+        self.audio.finish()
+        await asyncio.wait_for(self.audio.task, 3)
+        self.assertEqual(self.audio.phase, "accepted")
+        self.audio.error.assert_not_awaited()
+        request = json.loads((self.base / "shared.json").read_text())
+        self.assertEqual(request["action"], "submit")
+        self.assertFalse(Path(request["audio_file"]).exists())
+        self.audio.notice.assert_awaited_with("Shared fixture accepted")
+
+    async def test_shared_capture_accepts_pipewire_quiet_sigint_exit_one(self):
+        await self.configure_shared_receiver()
+        with patch.dict(os.environ, {"CAPTURE_STOP_CODE": "1", "CAPTURE_QUIET": "1"}):
+            await self.audio.start("atvvoice-shield-remote")
+            self.audio.finish()
+            await asyncio.wait_for(self.audio.task, 3)
+        self.assertEqual(self.audio.phase, "accepted")
+        self.audio.error.assert_not_awaited()
+        request = json.loads((self.base / "shared.json").read_text())
+        self.assertEqual(request["action"], "submit")
+        self.assertFalse(Path(request["audio_file"]).exists())
+
+    async def test_shared_capture_cancellation_drains_before_releasing_ownership(self):
+        await self.configure_shared_receiver()
+        await self.audio.start("atvvoice-shield-remote")
+        await self.audio.close()
+        self.assertEqual(json.loads((self.base / "shared.json").read_text()), {"action": "abort"})
+        self.assertFalse(self.audio.busy)
+        self.audio.error.assert_not_awaited()
+        self.assertEqual(list(self.paths.runtime.glob("voice-*")), [])
+
+    async def test_shared_ownership_rejection_never_opens_the_microphone(self):
+        await self.configure_shared_receiver()
+        with patch.dict(os.environ, {"RECEIVER_REJECT": "1"}):
+            with self.assertRaisesRegex(RuntimeError, "resource_busy"):
+                await self.audio.start("atvvoice-shield-remote")
+            await self.audio.task
+        self.assertFalse((self.base / "capture.json").exists())
+        self.assertFalse((self.base / "shared.json").exists())
+
+    async def test_disconnected_input_discards_shared_capture_without_submission(self):
+        await self.configure_shared_receiver()
+        def disconnected():
+            raise OSError("remote disconnected")
+        self.audio.input_check = disconnected
+        await self.audio.start("atvvoice-shield-remote")
+        self.audio.finish()
+        await asyncio.wait_for(self.audio.task, 3)
+        self.assertEqual(self.audio.phase, "failed")
+        self.assertEqual(json.loads((self.base / "shared.json").read_text()), {"action": "abort"})
+        self.assertIn("disconnected", self.audio.failure)

@@ -271,7 +271,8 @@ Ui.BarWidget {
   Component {
     id: icon
     Item {
-      anchors.fill: parent
+      width: Style.bar.iconCanvas
+      height: width
       Text {
         anchors.centerIn: parent
         text: "󰚩"

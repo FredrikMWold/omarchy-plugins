@@ -423,7 +423,8 @@ BarWidget {
     id: scooterStatusIcon
 
     Item {
-      anchors.fill: parent
+      width: Style.bar.iconCanvas
+      height: width
 
       ScooterIcon {
         anchors.centerIn: parent
@@ -433,16 +434,12 @@ BarWidget {
       }
 
       Rectangle {
-        width: Math.max(5, parent.width * 0.34)
+        width: Style.space(6)
         height: width
         radius: width / 2
         anchors.right: parent.right
         anchors.bottom: parent.bottom
-        anchors.rightMargin: -Style.space(1)
-        anchors.bottomMargin: -Style.space(1)
         color: root.indicatorColor
-        border.color: root.bar ? root.bar.background : Color.background
-        border.width: 1
 
         Rectangle {
           visible: root.indicatorHollow

@@ -9,7 +9,8 @@ impersonation, ADB, or Home Assistant installation are required.
 
 Double-press Menu/settings within 500 ms to change targets. A single Menu press
 is reserved and ignored.
-The bar icon and a desktop notification show the target.
+The bar icon shows the target. Mode switches do not show a desktop notification;
+errors and voice-recording notices still do.
 
 With a Sony soundbar configured, every target selection also selects **HDMI1
 for Shield** or **HDMI2 for Computer**. This includes double-Menu, panel buttons,
@@ -27,9 +28,9 @@ to the computer or Shield while a soundbar is configured.
 | Play/pause | Active Theater `play-pause`; prior unique MPRIS player otherwise | Native media key |
 | Rewind / fast-forward | Active Theater seek, -/+10 seconds; prior supported MPRIS seek otherwise | Native keys; the Shield app decides the interval |
 | Volume | Soundbar, one-step adjustments; default computer output in 5% steps if no soundbar is configured | Soundbar, one-step adjustments; native Shield volume keys if no soundbar is configured |
-| Power | Ignored (never sleeps or shuts down this computer) | Toggle Shield sleep / wake |
+| Power | Close the focused window | Toggle Shield sleep / wake |
 | Speak / Microphone | Single press: toggle dictation after 500 ms. Double press: record a voice command; next press sends it | Single press ignored except to finish a recording. Double press: same voice-command recording |
-| Netflix | Ignored | Ignored |
+| Netflix | Dismiss the most recent notification | Ignored |
 
 In Computer mode, press Speak once to start dictation and again to stop
 and transcribe, just like Omarchy's Super+Ctrl+X shortcut. It temporarily selects
@@ -40,6 +41,16 @@ without a release, and releasing it do not toggle again. Voxtype must be
 installed and running; command failures use the router's existing error
 notification and panel reporting, never a Search or keyboard fallback. Ordinary
 single presses wait 500 ms so a double press cannot accidentally start dictation.
+
+The bottom **Netflix** button dismisses the most recent on-screen notification in
+Computer mode, using the same Omarchy action as Super+Comma. Each fresh press
+dismisses one notification; holding it does not dismiss more, and pressing it when
+there are no popups does nothing. Notification history is preserved. Select is
+unchanged, and Netflix remains ignored in Shield mode.
+
+In Computer mode, **Power/Off** sends the normal close request to the focused
+window, just like Super+W. Each fresh press closes one window; holding the button
+does not close additional windows. It never sleeps or shuts down the computer.
 
 ### Mode-independent voice commands
 
@@ -87,6 +98,30 @@ fresh speech is not removed using a fixed-duration trim. This also isolates
 ordinary single-press dictation recordings.
 There is **no retry** after timeout or unclear acknowledgement: check the
 receiving application's state before submitting again.
+
+### Optional hold-to-talk and shared capture
+
+The same plugin can use hold-to-talk instead of single/double-press Speak.
+Configure its existing `configure_voice` request with `"activation":"hold"`
+and `"ownership":"shared-recognition"` alongside the receiver command.
+Without these options, existing dictation and double-press behavior is unchanged.
+Hold mode uses Speak for the configured receiver in either target; keyboard
+dictation remains available.
+
+The receiver executable owns transcription and assistant delivery; the plugin
+owns Bluetooth, buttons and recording. No OpenClaw imports or copied router are
+required. OpenClaw's `services/submit-shield` is one compatible receiver.
+The shared capture protocol reserves the voice pipeline before opening
+`pw-record`, using `--capture --lease-id ... --job-id ... --request-id ...`.
+The receiver acknowledges the matching capture identity before recording starts.
+On release, the plugin drains and validates the recording, then sends one
+`{"action":"submit","audio_file":"..."}` line over stdin.
+Early releases, input resets and disconnects discard unfinished captures.
+Cancellation drains the recorder before sending `{"action":"abort"}`; uncertain
+cleanup uses `--abort-capture` with that exact capture identity.
+Shared ownership prevents competing dictation/assistant captures from using the
+same transcription worker. The receiver remains an external command, so
+OpenClaw conversations, reasoning and speech stay outside this plugin.
 
 Shield presses/releases use the protocol's `START_LONG`/`END_LONG` events.
 Power instead sends one `POWER`/`SHORT` per press, including when held, so it
@@ -235,6 +270,11 @@ audio input. It uses the remote's actual microphone over ATVV v0.4, with 8 kHz
 mono ADPCM audio. Capture opens when an application connects to this input and
 closes when its capture clients disconnect. The source disappears when the remote
 disconnects and is recreated after reconnection.
+
+If the remote ends its stream at its firmware timeout (about 15 seconds on this
+SHIELD), the daemon resumes it while a capture client remains attached instead
+of leaving dictation recording silence. Stopping/cancelling dictation still
+closes the microphone normally; Voxtype's configured recording limit is unchanged.
 
 The plugin's Microphone button saves the current default input, temporarily
 selects `atvvoice-shield-remote`, and starts the existing Voxtype daemon. Voxtype

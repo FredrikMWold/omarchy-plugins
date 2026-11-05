@@ -101,6 +101,66 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
             self.backend.computer.key.assert_awaited_with(code, repeat=False)
         self.backend.client.send_key_command.assert_not_called()
 
+    async def test_netflix_dismisses_one_notification_per_fresh_computer_press(self):
+        with patch.object(router, "run", new_callable=AsyncMock, return_value="ok") as command:
+            for value in (1, 1, 2, 0, 2):
+                await self.backend.key(393, value, 1)
+            command.assert_awaited_once_with(["omarchy-shell", "notifications", "dismissOne"])
+            self.assertEqual(self.backend.last_action, "Computer: dismiss last notification")
+            await self.press(393, 2)
+            self.assertEqual(command.await_count, 2)
+        self.backend.computer.key.assert_not_awaited()
+        self.backend.client.send_key_command.assert_not_called()
+
+    async def test_netflix_with_no_notification_is_a_successful_noop(self):
+        self.backend.last_error = "Previous error"
+        self.backend.last_notice = "Previous notice"
+        with patch.object(router, "run", new_callable=AsyncMock, return_value="none") as command:
+            await self.press(393)
+        command.assert_awaited_once_with(["omarchy-shell", "notifications", "dismissOne"])
+        self.assertEqual(self.backend.last_action, "Computer: no notification to dismiss")
+        self.assertEqual(self.backend.last_error, "")
+        self.assertEqual(self.backend.last_notice, "")
+        self.backend.notice.assert_not_awaited()
+
+    async def test_netflix_remains_ignored_on_shield_even_when_disconnected(self):
+        self.backend.target = "shield"
+        self.backend.shield_connected = False
+        with patch.object(router, "run", new_callable=AsyncMock) as command:
+            await self.backend.key(393, 1, 1)
+            await self.backend.key(393, 2, 2)
+            await self.backend.key(393, 0, 3)
+        command.assert_not_awaited()
+        self.backend.computer.key.assert_not_awaited()
+        self.backend.client.send_key_command.assert_not_called()
+
+    async def test_netflix_held_on_shield_cannot_dismiss_after_target_switch(self):
+        await self.backend.select("shield")
+        with patch.object(router, "run", new_callable=AsyncMock, return_value="ok") as command:
+            await self.backend.key(393, 1, 1)
+            await self.backend.select("computer")
+            await self.backend.key(393, 1, 2)
+            await self.backend.key(393, 2, 3)
+            await self.backend.key(393, 0, 4)
+            command.assert_not_awaited()
+            await self.press(393, 5)
+            command.assert_awaited_once_with(["omarchy-shell", "notifications", "dismissOne"])
+
+    async def test_netflix_dismissal_errors_are_explicit_without_key_fallback(self):
+        for error in (OSError("omarchy-shell missing"), RuntimeError("Notification service unavailable")):
+            with self.subTest(error=error), patch.object(
+                router, "run", new_callable=AsyncMock, side_effect=error,
+            ):
+                with self.assertRaises(type(error)) as raised:
+                    await self.backend.key(393, 1, 1)
+                self.assertIs(raised.exception, error)
+                await self.backend.key(393, 0, 2)
+        with patch.object(router, "run", new_callable=AsyncMock, return_value="invalid"):
+            with self.assertRaisesRegex(RuntimeError, "unexpected response"):
+                await self.backend.key(393, 1, 3)
+        self.backend.computer.key.assert_not_awaited()
+        self.backend.client.send_key_command.assert_not_called()
+
     async def test_microphone_toggles_dictation_once_per_fresh_computer_press(self):
         self.backend.computer = router.Computer()
         with self.dictation_commands() as command:
@@ -152,7 +212,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         for target in ("computer", "shield"):
             with self.subTest(target=target):
                 self.backend.target = target
-                self.backend.audio_input = Mock(busy=False, phase="idle")
+                self.backend.audio_input = Mock(busy=False, phase="idle", hold_enabled=False)
                 self.backend.audio_input.start = AsyncMock()
                 self.backend.toggle_dictation = AsyncMock()
                 self.backend.dictation_state = AsyncMock(return_value="idle")
@@ -171,6 +231,37 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
                 self.backend.audio_input.finish.assert_called_once()
                 await self.backend.key(217, 0, 2.1)
                 self.assertEqual(self.backend.target, target)
+
+    async def test_optional_hold_records_on_press_and_submits_only_on_release(self):
+        for target in ("computer", "shield"):
+            with self.subTest(target=target):
+                self.backend.target = target
+                audio = Mock(busy=False, phase="idle", hold_enabled=True)
+                audio.start = AsyncMock()
+                self.backend.audio_input = audio
+                self.backend.toggle_dictation = AsyncMock()
+                await self.backend.key(217, 1, 1)
+                audio.start.assert_awaited_once_with(router.REMOTE_MIC, wait_ready=False)
+                audio.phase = "recording"
+                for value in (1, 2):
+                    await self.backend.key(217, value, 1.1)
+                audio.finish.assert_not_called()
+                await self.backend.key(217, 0, 2)
+                audio.finish.assert_called_once()
+                self.backend.toggle_dictation.assert_not_awaited()
+                self.assertEqual(self.backend.target, target)
+
+    async def test_hold_released_before_readiness_is_discarded(self):
+        audio = Mock(busy=False, phase="idle", hold_enabled=True)
+        audio.start = AsyncMock()
+        audio.close = AsyncMock()
+        self.backend.audio_input = audio
+        await self.backend.key(217, 1, 1)
+        audio.phase = "starting"
+        await self.backend.key(217, 0, 1.1)
+        audio.close.assert_awaited_once()
+        audio.finish.assert_not_called()
+        self.assertIn("discarded", self.backend.last_action)
 
     async def test_target_change_cancels_pending_speak(self):
         self.backend.toggle_dictation = AsyncMock()
@@ -349,10 +440,26 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.backend.client.send_key_command.call_count, 2)
         self.backend.computer.key.assert_not_awaited()
 
-    async def test_power_never_reaches_computer(self):
-        await self.press(116)
-        await self.backend.key(116, 2, 2)
-        self.backend.computer.key.assert_not_awaited()
+    async def test_computer_power_closes_one_window_per_fresh_press(self):
+        self.backend.computer = router.Computer()
+        with patch.object(router, "run", new_callable=AsyncMock, return_value="ok") as command:
+            for value in (1, 1, 2, 2, 0, 2):
+                await self.backend.key(116, value, 1)
+            command.assert_awaited_once_with(
+                ["hyprctl", "eval", "hl.dispatch(hl.dsp.window.close())"]
+            )
+            await self.press(116, 2)
+            self.assertEqual(command.await_count, 2)
+        self.backend.client.send_key_command.assert_not_called()
+
+    async def test_computer_power_reports_close_failure_without_fallback(self):
+        self.backend.computer = router.Computer()
+        with patch.object(router, "run", new_callable=AsyncMock, return_value="Close rejected") as command:
+            with self.assertRaisesRegex(RuntimeError, "Hyprland rejected the action: Close rejected"):
+                await self.backend.key(116, 1, 1)
+            command.assert_awaited_once_with(
+                ["hyprctl", "eval", "hl.dispatch(hl.dsp.window.close())"]
+            )
         self.backend.client.send_key_command.assert_not_called()
 
     async def test_offline_shield_power_is_not_sent_to_computer(self):
@@ -367,8 +474,11 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.backend.select("shield")
         await self.backend.key(116, 1, 1)
         await self.backend.select("computer")
+        await self.backend.key(116, 1, 1.1)
+        await self.backend.key(116, 2, 1.5)
         await self.backend.key(116, 0, 2)
         self.backend.client.send_key_command.assert_called_once_with("POWER", "SHORT")
+        self.backend.computer.key.assert_not_awaited()
 
     async def test_double_menu_switches_without_forwarding_menu(self):
         await self.press(139, 1)
@@ -380,6 +490,18 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.press(139, 2)
         await self.press(139, 2.4)
         self.assertEqual(self.backend.target, "computer")
+        self.backend.notice.assert_not_awaited()
+
+    async def test_target_selection_updates_status_without_notifications(self):
+        for target in ("shield", "shield", "computer", "computer"):
+            self.backend.last_error = "Previous error"
+            self.backend.last_notice = "Previous notice"
+            state = await self.backend.request({"command": "target", "target": target})
+            self.assertEqual(state["target"], target)
+            self.assertEqual(state["last_action"], f"Target: {target}")
+            self.assertEqual(state["error"], "")
+            self.assertEqual(self.backend.last_notice, "")
+        self.backend.notice.assert_not_awaited()
 
     def assert_soundbar_call(self, call, port, host="soundbar.test"):
         arguments = call.args[0]
@@ -683,7 +805,7 @@ class RoutingTests(unittest.IsolatedAsyncioTestCase):
         for target in ("computer", "shield"):
             await self.backend.select(target)
             for code in router.IGNORED:
-                if target == "computer" and code == 217:
+                if target == "computer" and code in {217, 393}:
                     continue
                 await self.press(code)
         self.backend.client.send_key_command.assert_not_called()

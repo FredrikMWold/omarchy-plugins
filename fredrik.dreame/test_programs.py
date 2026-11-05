@@ -8,7 +8,7 @@ from unittest.mock import patch
 from backend import Backend, Store
 from cloud import CloudError
 from native import MODEL, PROPERTIES
-from planner import model_answer
+from planner import model_answer, plan
 from programs import ProgramService, public_program
 from test_cloud import PROFILE, SESSION
 from test_native import job, snapshot
@@ -435,6 +435,37 @@ class ProgramTests(unittest.TestCase):
                 public_program(self.store)
             self.assertEqual(failure.exception.code, "INVALID_STORAGE")
             self.store.write("program.json", value)
+
+
+class PlannerCommandTests(unittest.TestCase):
+    def test_planning_uses_supported_cli_flags_with_history_sync_disabled(self):
+        planned = packet([job()])
+        response = json.dumps({
+            "type": "assistant.message",
+            "data": {"model": "gpt-6-luna", "content": json.dumps(planned), "toolRequests": []},
+        })
+        with tempfile.TemporaryDirectory() as root:
+            contract = Path(root) / "cleaning-program.mjs"
+            contract.touch()
+            with patch("planner.CONTRACT", contract), \
+                    patch("planner.Path.home", return_value=Path(root) / "home"), \
+                    patch("planner.shutil.which", return_value="/fixture/executable"), \
+                    patch("planner.run_bounded", side_effect=["Fixture contract", response, json.dumps(planned)]) as run:
+                self.assertEqual(plan("Mop the kitchen", PROGRAM_ID, root), planned)
+
+            self.assertEqual(run.call_count, 3)
+            arguments, options = run.call_args_list[1]
+            command, request = arguments
+            self.assertEqual(command[:3], ["copilot", "--model", "gpt-6-luna"])
+            self.assertIn("--sync-session", command)
+            self.assertEqual(command[command.index("--sync-session") + 1], "off")
+            self.assertNotIn("--no-remote", command)
+            self.assertNotIn("--no-remote-export", command)
+            for flag in ("--available-tools=", "--disable-builtin-mcps", "--no-custom-instructions", "--no-ask-user"):
+                self.assertIn(flag, command)
+            self.assertIn("Mop the kitchen", request)
+            self.assertEqual(Path(options["cwd"]).parent, Path(root))
+            self.assertEqual(run.call_args_list[2].args[0], ["node", str(contract), "validate", PROGRAM_ID])
 
 
 class PlannerEventTests(unittest.TestCase):

@@ -650,6 +650,8 @@ class Computer:
                 await send_key(NAVIGATION[code])
         elif code == 172:
             await self.home()
+        elif code == 116:
+            await dispatch("hl.dsp.window.close()")
         elif code in {164, 168, 208}:
             await self.media(code)
         elif code in {114, 115}:
@@ -1030,8 +1032,8 @@ class Router:
             raise RuntimeError(f"Cannot preserve target; prior target retained: {error}") from error
         self.target = target
         self.last_error = ""
+        self.last_notice = ""
         self.last_action = f"Target: {target}"
-        await self.notice("Target: Shield TV" if target == "shield" else "Target: Computer")
 
     async def switch_soundbar(self, target: str) -> None:
         if not self.config.soundbar_host:
@@ -1121,6 +1123,14 @@ class Router:
             self.last_key = f"{code}:{value}"
             if value == 0:
                 self.pressed.discard(code)
+                if code == 217 and self.audio_input.hold_enabled:
+                    if self.audio_input.phase == "starting":
+                        await self.audio_input.close()
+                        self.last_action = "Voice command: released before genuine readiness, discarded"
+                    elif self.audio_input.phase == "recording":
+                        self.audio_input.finish()
+                        self.last_action = "Voice command: sending finalized held recording"
+                    return
                 await self.computer.release_direction(code)
                 key = self.shield_pressed.pop(code, None)
                 if key and self.client and self.shield_connected:
@@ -1141,9 +1151,26 @@ class Router:
                 return
             if code == 217:
                 if value == 1:
-                    await self.speak(timestamp)
+                    if self.audio_input.hold_enabled:
+                        self.cancel_speak()
+                        if self.audio_input.busy or self.voice_jobs:
+                            raise RuntimeError("Finish the active voice request before holding Speak")
+                        await self.audio_input.start(REMOTE_MIC, wait_ready=False)
+                        self.last_action = "Voice command: hold to record, release to submit"
+                    else:
+                        await self.speak(timestamp)
                 return
-            if code in IGNORED or (code == 116 and self.target == "computer"):
+            if code == 393 and self.target == "computer":
+                if value == 1:
+                    response = await run(["omarchy-shell", "notifications", "dismissOne"])
+                    if response not in {"ok", "none"}:
+                        raise RuntimeError(f"Notification dismissal returned an unexpected response: {response}")
+                    self.last_action = ("Computer: dismiss last notification" if response == "ok"
+                                        else "Computer: no notification to dismiss")
+                    self.last_error = ""
+                    self.last_notice = ""
+                return
+            if code in IGNORED:
                 self.last_action = f"Ignored key {code}"
                 return
             if code not in SHIELD_KEYS:
@@ -1444,24 +1471,68 @@ class Router:
                 self.input_connected = self.input_captured = True
                 self.input_waiting_for_release = bool(held_at_capture)
                 self.input_error = ""
+                self.audio_input.input_check = device.active_keys
                 async def read_events() -> None:
+                    pending_speak = []
+                    synchronizing = False
+
+                    async def dispatch(event) -> None:
+                        if self.input_waiting_for_release:
+                            if event.value == 0:
+                                held_at_capture.discard(event.code)
+                            else:
+                                held_at_capture.add(event.code)
+                            self.input_waiting_for_release = bool(held_at_capture)
+                            return
+                        if (event.value == 2 and time.time() - event.timestamp() > 0.25
+                                and ((event.code in FOCUS_DIRECTIONS and self.target == "computer")
+                                     or (event.code in VOLUME_KEYS and self.config.soundbar_host))):
+                            return
+                        try:
+                            await self.key(event.code, event.value, event.timestamp())
+                        except (ValueError, RuntimeError, ConnectionClosed, OSError) as error:
+                            await self.error(str(error))
+
                     async for event in device.async_read_loop():
+                        try:
+                            hold_enabled = self.audio_input.hold_enabled
+                        except (ValueError, OSError):
+                            pending_speak.clear()
+                            hold_enabled = False
+                        if hold_enabled:
+                            if event.type == 0:
+                                # Disconnect synthesizes key-up with SYN_REPORT=1.
+                                if event.code == 3 or (event.code == 0 and event.value != 0):
+                                    phase = self.audio_input.phase
+                                    discarded = bool(pending_speak) or phase in (
+                                        "starting", "recording", "finalizing")
+                                    pending_speak.clear()
+                                    synchronizing = True
+                                    self.input_waiting_for_release = True
+                                    self.pressed.discard(217)
+                                    if phase in ("starting", "recording", "finalizing"):
+                                        await self.audio_input.close()
+                                    if discarded and phase not in ("sending", "accepted"):
+                                        await self.error(
+                                            "Remote input reset before submission; recording discarded")
+                                elif event.code == 0:
+                                    if synchronizing:
+                                        held_at_capture.clear()
+                                        held_at_capture.update(device.active_keys())
+                                        self.input_waiting_for_release = bool(held_at_capture)
+                                        synchronizing = False
+                                    else:
+                                        frame, pending_speak = pending_speak, []
+                                        for pending in frame:
+                                            await dispatch(pending)
+                                continue
+                            if synchronizing:
+                                continue
+                            if event.type == 1 and event.code == 217:
+                                pending_speak.append(event)
+                                continue
                         if event.type == 1:
-                            if self.input_waiting_for_release:
-                                if event.value == 0:
-                                    held_at_capture.discard(event.code)
-                                else:
-                                    held_at_capture.add(event.code)
-                                self.input_waiting_for_release = bool(held_at_capture)
-                                continue
-                            if (event.value == 2 and time.time() - event.timestamp() > 0.25
-                                    and ((event.code in FOCUS_DIRECTIONS and self.target == "computer")
-                                         or (event.code in VOLUME_KEYS and self.config.soundbar_host))):
-                                continue
-                            try:
-                                await self.key(event.code, event.value, event.timestamp())
-                            except (ValueError, RuntimeError, ConnectionClosed, OSError) as error:
-                                await self.error(str(error))
+                            await dispatch(event)
 
                 async def keep_held_directions_live() -> None:
                     while True:
@@ -1500,8 +1571,9 @@ class Router:
                 self.pressed.clear()
                 self.last_menu = None
                 self.cancel_speak()
-                if self.audio_input.phase in ("starting", "recording"):
+                if self.audio_input.phase in ("starting", "recording", "finalizing"):
                     await self.audio_input.close()
+                self.audio_input.input_check = None
                 try:
                     await self.computer.cancel_directions()
                 except (RuntimeError, OSError) as error:
@@ -1523,6 +1595,10 @@ class Router:
             await self.configure(payload.get("values"))
         elif command == "configure_voice":
             value = {"version": 1, "command": payload.get("receiver")}
+            if "activation" in payload:
+                value["activation"] = payload["activation"]
+            if "ownership" in payload:
+                value["ownership"] = payload["ownership"]
             file = self.paths.config / "voice-receiver.json"
             with tempfile.TemporaryDirectory(dir=self.paths.config) as directory:
                 candidate = Path(directory) / "receiver.json"

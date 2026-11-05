@@ -171,7 +171,8 @@ Ui.BarWidget {
   Component {
     id: statusIcon
     Item {
-      anchors.fill: parent
+      width: Style.bar.iconCanvas
+      height: width
       Text {
         anchors.centerIn: parent
         text: root.voicePhase === "recording" ? "󰍬" : root.target === "shield" ? "󰄛" : "󰍹"

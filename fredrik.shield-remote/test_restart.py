@@ -9,7 +9,7 @@ import tempfile
 import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import router
 
@@ -57,7 +57,7 @@ class RestartTargetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.status(restarted))["target"], "shield")
         with self.assertRaisesRegex(RuntimeError, "Shield is disconnected.*not sent to the computer"):
             await restarted.key(164, 1, 1)
-        self.assertTrue(all(command[0] == "notify-send" for command in self.commands))
+        self.assertEqual(self.commands, [])
 
     async def checkpoint(self, response):
         async def old_daemon(reader, writer):
@@ -210,6 +210,65 @@ class RestartTargetTests(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(all(item["target"] == "shield" for item in observations))
                 self.assertTrue(all(not item["error"] for item in observations))
                 self.assertIn("Shield is disconnected", (await self.status(restarted))["error"])
+            finally:
+                capture.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await capture
+
+    async def test_input_reset_discards_synthetic_release_but_fresh_hold_can_submit(self):
+        backend = router.Router(self.paths, self.config)
+        rule = self.base / "input.rules"
+        rule.write_text(router.rule_text(self.config.remote_address))
+        router.write_private_json(self.paths.config / "input-setup.json",
+                                  {"schema": 1, "address": self.config.remote_address})
+        audio = Mock(hold_enabled=True, busy=False, phase="idle")
+        async def start(*args, **kwargs):
+            audio.phase = "recording"
+        async def close():
+            audio.phase = "idle"
+        audio.start = AsyncMock(side_effect=start)
+        audio.close = AsyncMock(side_effect=close)
+        backend.audio_input = audio
+        complete = asyncio.Event()
+        test = self
+
+        class Device:
+            name = router.REMOTE_NAME
+            uniq = test.config.remote_address
+            info = SimpleNamespace(vendor=0x0955, product=0x7217)
+
+            def grab(self):
+                pass
+
+            def close(self):
+                pass
+
+            def active_keys(self):
+                return []
+
+            async def async_read_loop(self):
+                for kind, code, value in (
+                    (1, 217, 1), (0, 0, 0),
+                    (1, 217, 0), (0, 0, 1), (0, 0, 0),
+                ):
+                    yield SimpleNamespace(type=kind, code=code, value=value, timestamp=time.time)
+                audio.close.assert_awaited_once()
+                audio.finish.assert_not_called()
+                for kind, code, value in (
+                    (1, 217, 1), (0, 0, 0), (1, 217, 0), (0, 0, 0),
+                ):
+                    yield SimpleNamespace(type=kind, code=code, value=value, timestamp=time.time)
+                complete.set()
+                await asyncio.Event().wait()
+
+        with (patch.object(router, "RULE", rule),
+              patch.object(router, "find_remote", return_value=Path("/dev/input/test-owned")),
+              patch.object(router, "InputDevice", return_value=Device())):
+            capture = asyncio.create_task(backend.input_loop())
+            try:
+                await asyncio.wait_for(complete.wait(), 3)
+                self.assertEqual(audio.start.await_count, 2)
+                audio.finish.assert_called_once()
             finally:
                 capture.cancel()
                 with self.assertRaises(asyncio.CancelledError):

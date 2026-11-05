@@ -83,7 +83,7 @@ Ui.Panel {
           }
           Text {
             width: parent.width
-            text: "Double-press Menu to switch targets. Double-press Speak in either mode to record a voice command; press Speak once more to send it. A single Speak press in Computer mode still toggles dictation after the 500 ms double-press window. Computer Home opens Home Theater. For Shield app voice search, use the app's on-screen microphone. Shield Power toggles sleep/wake."
+            text: "Double-press Menu to switch targets. Double-press Speak in either mode to record a voice command; press Speak once more to send it. A single Speak press in Computer mode still toggles dictation after the 500 ms double-press window. Computer Home opens Home Theater. Computer Power closes the focused window. For Shield app voice search, use the app's on-screen microphone. Shield Power toggles sleep/wake."
             color: Color.muted
             wrapMode: Text.WordWrap
             font.family: root.bar.fontFamily
@@ -380,7 +380,7 @@ Ui.Panel {
           }
           Text {
             width: parent.width
-            text: root.backend && root.backend.last_action ? root.backend.last_action : "Power controls Shield only; it is ignored on the computer. Microphone toggles remote-mic dictation on the computer and is ignored on Shield. Netflix is ignored. Single Menu is reserved."
+            text: root.backend && root.backend.last_action ? root.backend.last_action : "Power closes the focused window on the computer and toggles sleep/wake on Shield. Microphone toggles remote-mic dictation on the computer and is ignored on Shield. Netflix dismisses the latest notification on the computer and is ignored on Shield. Single Menu is reserved."
             color: Color.muted
             wrapMode: Text.WordWrap
             font.family: root.bar.fontFamily

@@ -81,7 +81,7 @@ def plan(prompt, request_id, private_root):
     command = [
         "copilot", "--model", MODEL, "--available-tools=", "--disable-builtin-mcps",
         "--no-custom-instructions", "--no-ask-user",
-        "--no-auto-update", "--no-remote", "--no-remote-export", "--log-level", "none",
+        "--no-auto-update", "--sync-session", "off", "--log-level", "none",
         "--silent", "--stream", "off", "--no-color", "--output-format", "json",
     ]
     configuration = Path.home() / ".copilot/mcp-config.json"

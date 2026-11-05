@@ -16,6 +16,13 @@ output from an earlier capture is rejected instead of entering a new recording.
 The cutoff uses each capture's start time, not fixed-duration speech trimming.
 This applies to ordinary dictation and generic voice-command capture.
 
+Some SHIELD firmware ends an audio stream after about 15 seconds even with
+v0.4 keepalives. In on-demand mode, the daemon reopens an unexpectedly stopped
+stream while a PipeWire recorder is still attached, keeping the same input
+available for the rest of the recording. Explicit microphone close/toggle,
+consumer disconnect and non-on-demand operation do not trigger this recovery.
+The recorder still owns its normal stop/cancel behavior and duration limit.
+
 The upstream MIT license and copyright are preserved in [LICENSE](LICENSE).
 Distribution packaging metadata was omitted; this daemon is installed only by
 the plugin. Dependencies remain pinned by `Cargo.lock`.

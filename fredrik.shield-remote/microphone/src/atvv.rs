@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 use tokio::time::{self, Instant};
 
 use crate::consumer;
-use crate::protocol::types::{AudioStopReason, CtlEvent, StreamId};
+use crate::protocol::types::{AudioStopReason, CtlEvent, ProtocolVersion, StreamId};
 use crate::protocol::Protocol;
 use crate::pw::AudioChunk;
 
@@ -161,8 +161,7 @@ pub async fn run_session(
 
     // Track the current stream ID (set on AudioStart, used for MIC_CLOSE/keepalive).
     let mut current_stream_id: Option<StreamId> = None;
-
-
+    let mut consumer_count = 0;
 
     // Keepalive: reset the remote's audio transfer timeout (spec §4.6.1)
     // using protocol.keepalive_cmd() (MIC_EXTEND for v1.0, MIC_OPEN for v0.4).
@@ -186,8 +185,14 @@ pub async fn run_session(
                 match protocol.parse_ctl(&data) {
                     CtlEvent::AudioStop { reason } => {
                         tracing::info!("AUDIO_STOP (reason={:?})", reason);
+                        // Some v0.4 remotes time out despite MIC_OPEN keepalives.
+                        let resume_capture = mic_on_demand
+                            && consumer_count > 0
+                            && state == State::Streaming
+                            && protocol.version() == ProtocolVersion::V0_4;
                         // For HTT button release, remote already stopped — don't send `MIC_CLOSE`
-                        if !matches!(reason, AudioStopReason::HttButtonRelease)
+                        if !resume_capture
+                            && !matches!(reason, AudioStopReason::HttButtonRelease)
                             && state == State::Streaming
                         {
                             let sid = current_stream_id.unwrap_or(StreamId::MIC_OPEN);
@@ -195,6 +200,14 @@ pub async fn run_session(
                             tracing::info!("Sent MIC_CLOSE");
                         }
                         close_mic_reset!(state, last_seq, current_stream_id);
+                        if resume_capture {
+                            tracing::warn!("Remote stopped audio during an active capture; reopening microphone");
+                            ble.write_command(&protocol.mic_open_cmd()).await?;
+                            set_state(State::Opening, &mut state);
+                            if frame_timeout_enabled {
+                                frame_timer.as_mut().reset(Instant::now() + timeouts.frame_timeout);
+                            }
+                        }
                     }
                     CtlEvent::AudioStart { reason, codec, stream_id } => {
                         tracing::info!("AUDIO_START (reason={:?}, codec={:?}, stream_id={:?})", reason, codec, stream_id);
@@ -329,6 +342,7 @@ pub async fn run_session(
                 }
             } => {
                 if let Some(consumer::ConsumerEvent::Changed(count)) = event {
+                    consumer_count = count;
                     if mic_on_demand {
                         if count > 0 && state == State::Connected {
                             ble.write_command(&protocol.mic_open_cmd()).await?;
@@ -1037,6 +1051,122 @@ mod tests {
             .unwrap();
         let result = session.await.unwrap();
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_mic_on_demand_recovers_v04_timeout_without_reopening_after_stop() {
+        tokio::time::pause();
+
+        let (device, mut ctrl) = mock_device();
+        let (audio_tx, mut audio_rx) = tokio_mpsc::channel(64);
+        let (state_tx, mut state_rx) = tokio::sync::watch::channel(State::Connected);
+        let (consumer_tx, consumer_rx) = tokio_mpsc::channel(16);
+        let (command_tx, mut command_rx) = tokio_mpsc::channel(16);
+        let timeouts = SessionTimeouts {
+            frame_timeout: Duration::from_secs(5),
+            keepalive: Duration::from_secs(10),
+        };
+        let mut protocol = ProtocolV04::new();
+        protocol
+            .on_caps_resp(&Capabilities {
+                version: ProtocolVersion::V0_4,
+                codecs: Codecs::ADPCM_8KHZ,
+                interaction_model: InteractionModel::OnRequest,
+                audio_frame_size: AudioFrameSize(134),
+            })
+            .unwrap();
+        let streams = BleStreams {
+            ctl: device.ctl_notifications().await.unwrap(),
+            rx: device.rx_notifications().await.unwrap(),
+            events: device.connection_events().await.unwrap(),
+        };
+        let session = tokio::spawn(async move {
+            run_session(
+                &device,
+                &mut protocol,
+                streams,
+                SessionConfig {
+                    audio_tx,
+                    timeouts: &timeouts,
+                    command_rx: Some(&mut command_rx),
+                    state_tx: Some(&state_tx),
+                    consumer_rx: Some(consumer_rx),
+                    mic_on_demand: true,
+                },
+            )
+            .await
+        });
+
+        consumer_tx
+            .send(consumer::ConsumerEvent::Changed(1))
+            .await
+            .unwrap();
+        assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
+        try_recv_all_commands(&mut ctrl.commands_rx).await;
+
+        for _ in 0..3 {
+            ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+            assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+            for seq in 0..15 {
+                ctrl.rx_tx.send(make_audio_frame(seq)).unwrap();
+                let chunk = time::timeout(Duration::from_millis(10), audio_rx.recv())
+                    .await
+                    .expect("active recording stopped receiving audio")
+                    .unwrap();
+                assert_eq!(chunk.samples.len(), 257);
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            try_recv_all_commands(&mut ctrl.commands_rx).await;
+            ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
+            assert!(
+                wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await,
+                "remote timeout left an active recording permanently silent"
+            );
+            assert_eq!(
+                try_recv_all_commands(&mut ctrl.commands_rx).await,
+                vec![V04_MIC_OPEN.to_vec()]
+            );
+        }
+
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+        command_tx.send(ExternalCommand::MicClose).await.unwrap();
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![V04_MIC_CLOSE.to_vec()]
+        );
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(*state_rx.borrow(), State::Connected);
+        assert!(try_recv_all_commands(&mut ctrl.commands_rx).await.is_empty());
+
+        consumer_tx
+            .send(consumer::ConsumerEvent::Changed(2))
+            .await
+            .unwrap();
+        assert!(wait_for_state(&mut state_rx, State::Opening, Duration::from_millis(10)).await);
+        try_recv_all_commands(&mut ctrl.commands_rx).await;
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_START]).unwrap();
+        assert!(wait_for_state(&mut state_rx, State::Streaming, Duration::from_millis(10)).await);
+        consumer_tx
+            .send(consumer::ConsumerEvent::Changed(0))
+            .await
+            .unwrap();
+        assert!(wait_for_state(&mut state_rx, State::Connected, Duration::from_millis(10)).await);
+        assert_eq!(
+            try_recv_all_commands(&mut ctrl.commands_rx).await,
+            vec![V04_MIC_CLOSE.to_vec()]
+        );
+        ctrl.ctl_tx.send(vec![CTL_AUDIO_STOP]).unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert_eq!(*state_rx.borrow(), State::Connected);
+        assert!(try_recv_all_commands(&mut ctrl.commands_rx).await.is_empty());
+
+        ctrl.event_tx
+            .send(DeviceConnectionEvent::Disconnected)
+            .unwrap();
+        session.await.unwrap().unwrap();
     }
 
     // ── Test: Consumer event ignored when disabled ──────────────────────
